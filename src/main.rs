@@ -75,21 +75,13 @@ struct Args {
     /// Disable HTTPS certificate verification.
     #[arg(long)]
     no_verify: bool,
-    /// Deprecated, no longer does anything: starting/running without a
-    /// CMS connection (showing the last cached schedule, or a "waiting
-    /// for CMS connection" splash if there's no cache) is now the
-    /// default -- see --disallow-offline for the opposite. Kept, doing
-    /// nothing, only so existing scripts/services passing this flag
-    /// don't break.
+    /// Deprecated, no longer does anything -- the old behavior is now
+    /// the default. Kept only so existing scripts don't break.
     #[arg(long)]
     allow_offline: bool,
-    /// Require a live CMS connection at startup: don't fall back to a
-    /// cached schedule (even if one exists) when the CMS can't be
-    /// reached, show a "waiting for CMS connection" splash and keep
-    /// retrying instead. This is the old, pre-0.7 default behavior
-    /// (which used to exit outright instead of retrying) for whoever
-    /// specifically wants a live check gating playback. If both this
-    /// and the now-inert --allow-offline are given, this one wins.
+    /// Require a live CMS connection at startup instead of falling
+    /// back to a cached schedule. Wins if both this and the now-inert
+    /// --allow-offline are given.
     #[arg(long)]
     disallow_offline: bool,
 }

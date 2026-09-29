@@ -363,33 +363,14 @@ pub struct Handler {
     /// writing `pending_auth`/`pending_network` and expecting the
     /// splash to somehow notice on its own.
     splash_state: server::SplashStateStore,
-    /// Same pattern as `pending_auth`, for a different real cause: no
-    /// cached settings.json to fall back to when the CMS can't be
-    /// reached (e.g. a brand-new totem's very first boot, before WiFi
-    /// has obtained an IP/working DNS yet), or `--disallow-offline` set
-    /// (deliberately skips the cache lookup even if one exists).
-    /// register_display() failing used to `bail!()` the whole process
-    /// out in this case -- crashing on startup repeatedly (systemd's
-    /// Restart= redoing the full Xorg/D-Bus/arexibo startup sequence
-    /// each time) until the network happened to come up in the brief
-    /// window before the next attempt. Now: the same empty-defaults,
-    /// fast-retry Handler as pending_auth, with its own accurate log
-    /// message and its own splash state (this isn't a CMS authorization
-    /// issue, and unlike pending_auth a live connection was never even
-    /// established this time).
+    /// Same pattern as `pending_auth`, for a different cause: no cache
+    /// to fall back to, or `--disallow-offline` set (skips the cache
+    /// lookup even if one exists). Own splash state (AwaitingConnection),
+    /// not folded into pending_auth's.
     pending_network: bool,
-    /// Consecutive collect_once() register_display() failures
-    /// (genuine connection errors, not an "unauthorized" answer --
-    /// that's pending_auth's own, separate, immediate transition) since
-    /// the display was last known to be reachable. Reset to 0 on any
-    /// successful register_display() call. Once this reaches
-    /// MAX_CONSECUTIVE_CONNECTION_FAILURES, collect_once() sets
-    /// pending_network the same way a fresh startup with no cache
-    /// would -- a single missed cycle (a brief network blip) doesn't
-    /// interrupt an otherwise fine, already-playing display, but a
-    /// sustained outage does eventually make that visible instead of
-    /// silently cycling stale content forever with no indication
-    /// anything's wrong.
+    /// Consecutive register_display() connection failures (not
+    /// "unauthorized" -- that's pending_auth's own path). Threshold
+    /// triggers AwaitingConnection (see status doc).
     consecutive_connection_failures: u32,
     /// Set once GetWeather fails with "not present" (v6/v7-only on our
     /// v5 endpoint) -- avoids retrying every cycle once known.
@@ -565,14 +546,8 @@ impl Handler {
         let res = match xmds.register_display() {
             Err(e) => {
                 log::warn!("CMS not reachable or call failed: {e:#}");
-                // Real report (--disallow-offline's own design): with
-                // --disallow-offline, a cached settings/schedule pair
-                // is deliberately never used as a startup shortcut even
-                // if one exists -- only a live CMS connection may ever
-                // let this display start playing anything. allow_offline
-                // (the default, and always true when awaiting_code -- no
-                // CMS address to even try reaching yet) is what gates
-                // whether the lookup below happens at all.
+                // --disallow-offline: never use the cache as a startup
+                // shortcut, even if one exists.
                 let cached = if allow_offline {
                     PlayerSettings::from_file(&setting_file).ok()
                 } else {
@@ -1302,34 +1277,12 @@ impl Handler {
                             // its next member.
                             let was_cycle_member = self.schedule.record_cycle_group_completion(
                                 self.current_layout, &self.criteria, &mut self.cycle_state);
-                            // Confirmed real from a difference with the
-                            // Windows client: when a layout completes
-                            // its own natural cycle and is still the
-                            // only one currently scheduled, Windows
-                            // moves on to "the next layout" -- which,
-                            // with only one, means reloading it fresh.
-                            // schedule_check() alone never does this on
-                            // its own (it only reloads when the
-                            // resolved layout set actually *changes*,
-                            // by design, for every other -- much more
-                            // frequent -- caller), so this needs its
-                            // own explicit check here instead.
-                            //
-                            // Real report (GitHub issue #1): this used
-                            // to fire for *every* single-layout
-                            // schedule, not just Cycle Playback/Sync
-                            // Group ones -- forcing a full page
-                            // navigation (and re-fetch of every asset)
-                            // on every ordinary loop, when 0.6.0's own
-                            // behavior (and the actual need for a
-                            // reload signal at all) was to let the
-                            // layout keep looping seamlessly via its
-                            // own GUI-side timers. Only Cycle Playback
-                            // (this playthrough just counted towards an
-                            // active group above) and Sync Group
-                            // displays (need their timers restarted in
-                            // lockstep) genuinely need this signal.
-                            let in_sync_group = self.settings.sync_role != SyncRole::None;
+                            // Only a genuine Cycle Playback/Sync Group
+                            // layout needs a forced reload here; an
+                            // ordinary single-layout schedule should
+                            // just keep looping via its own GUI timers
+                            // (see status doc for the full history).
+                            let in_sync_group = self.sync_layout_active;
                             let resolved = self.schedule.layouts_now(&self.criteria, &mut self.cycle_state);
                             let available: Vec<_> = resolved.iter().copied()
                                 .filter(|&id| self.cache.get_layout(id).is_some())
@@ -1505,13 +1458,8 @@ impl Handler {
                                MAX_CONSECUTIVE_CONNECTION_FAILURES);
                     return Ok(());
                 }
-                // Same transition (and the same reasoning) as the
-                // "previously authorized, now deauthorized" branch
-                // further down -- just for a different real cause
-                // (can't reach the CMS at all, vs. a successful call
-                // that says "not authorized"), so it gets its own
-                // splash state (AwaitingConnection) instead of being
-                // folded into pending_auth's own.
+                // Same transition as "deauthorized" below, different
+                // cause -> its own splash state (AwaitingConnection).
                 log::warn!("register_display failed {} times in a row: {e:#} -- \
                             reverting to the splash screen and retrying periodically",
                            self.consecutive_connection_failures);
@@ -3641,13 +3589,8 @@ mod pending_network_tests {
 
     #[test]
     fn disallow_offline_skips_the_cache_lookup_even_when_one_exists() {
-        // --disallow-offline's whole point: unlike the default
-        // (allow_offline=true), a cached settings.json is deliberately
-        // never used as a startup shortcut when the CMS can't be
-        // reached -- only a live connection may let this display start
-        // playing anything. Same unreachable-CMS setup as the test
-        // above, but this time with a *real* cached settings.json
-        // already on disk, and allow_offline=false.
+        // Same setup as the test above, but with a real cached
+        // settings.json on disk and allow_offline=false.
         let unreachable_port = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
@@ -3680,16 +3623,9 @@ mod pending_network_tests {
 
     #[test]
     fn collect_once_only_reverts_to_the_splash_after_three_consecutive_failures() {
-        // A single missed collection cycle (a brief network blip)
-        // mustn't interrupt an otherwise fine, already-playing display
-        // -- only a *sustained* outage (MAX_CONSECUTIVE_CONNECTION_FAILURES
-        // in a row) should. Constructed against an already-unreachable
-        // address (Handler::new's own error handling already covers the
-        // startup case in the tests above) with pending_network/
-        // consecutive_connection_failures explicitly reset to simulate
-        // an already-running, previously-healthy display -- this test
-        // is specifically about collect_once()'s own ongoing counter,
-        // not Handler::new's.
+        // Fields reset post-construction to simulate an already-
+        // running, previously-healthy display (not Handler::new's own
+        // startup-pending path, covered by the tests above).
         let unreachable_port = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
@@ -4846,7 +4782,7 @@ mod handle_trigger_code_tests {
         } else if handler.override_layout.is_none() {
             let was_cycle_member = handler.schedule.record_cycle_group_completion(
                 handler.current_layout, &handler.criteria, &mut handler.cycle_state);
-            let in_sync_group = handler.settings.sync_role != SyncRole::None;
+            let in_sync_group = handler.sync_layout_active;
             let resolved = handler.schedule.layouts_now(&handler.criteria, &mut handler.cycle_state);
             let available: Vec<_> = resolved.iter().copied()
                 .filter(|&id| handler.cache.get_layout(id).is_some())
@@ -4896,7 +4832,7 @@ mod handle_trigger_code_tests {
         } else if handler.override_layout.is_none() {
             let was_cycle_member = handler.schedule.record_cycle_group_completion(
                 handler.current_layout, &handler.criteria, &mut handler.cycle_state);
-            let in_sync_group = handler.settings.sync_role != SyncRole::None;
+            let in_sync_group = handler.sync_layout_active;
             let resolved = handler.schedule.layouts_now(&handler.criteria, &mut handler.cycle_state);
             let available: Vec<_> = resolved.iter().copied()
                 .filter(|&id| handler.cache.get_layout(id).is_some())
@@ -4911,6 +4847,62 @@ mod handle_trigger_code_tests {
         let msg = togui_rx.try_recv().expect("a Cycle Playback group of one must still reload");
         assert!(matches!(msg, ToGui::ForceReloadLayout(913, ForceReloadReason::CycleGroupOfOne)),
                 "must be force-reloaded with the CycleGroupOfOne reason");
+    }
+
+    #[test]
+    fn layout_completed_does_not_reload_when_sync_role_is_set_but_no_override_is_active() {
+        // sync_role alone is too broad -- only sync_layout_active
+        // (a genuine active override) should count.
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
+                                        std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+
+        let xml = r#"<schedule generated="2026-01-01 00:00:00" filterFrom="2026-01-01 00:00:00" filterTo="2026-01-02 00:00:00">
+  <layout file="913" fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07" scheduleid="1" priority="0" syncEvent="0" shareOfVoice="0" duration="60" isGeoAware="0" geoLocation="" cyclePlayback="0" groupKey="0" playCount="0" maxPlaysPerHour="0"/>
+  <default file="913" duration="60"/>
+</schedule>"#;
+        let tree = elementtree::Element::from_reader(xml.as_bytes()).unwrap();
+        handler.schedule = Schedule::parse(&tree).unwrap();
+        handler.cache.insert_fake_layout_for_test(913);
+        handler.layouts = vec![913];
+        handler.current_layout = 913;
+        // The exact real-report scenario: Sync Group role configured
+        // (Lead), but no Sync Group Command override is currently
+        // active on this display.
+        handler.settings.sync_role = SyncRole::Lead;
+        assert!(!handler.sync_layout_active,
+                "no override active -- this is the crux of the scenario being tested");
+        while togui_rx.try_recv().is_ok() {} // drain any startup messages
+
+        if handler.override_revert_on_completion && handler.override_layout.take().is_some() {
+            handler.override_revert_on_completion = false;
+            handler.schedule_check();
+        } else if handler.override_layout.is_none() {
+            let was_cycle_member = handler.schedule.record_cycle_group_completion(
+                handler.current_layout, &handler.criteria, &mut handler.cycle_state);
+            let in_sync_group = handler.sync_layout_active;
+            let resolved = handler.schedule.layouts_now(&handler.criteria, &mut handler.cycle_state);
+            let available: Vec<_> = resolved.iter().copied()
+                .filter(|&id| handler.cache.get_layout(id).is_some())
+                .collect();
+            if available == handler.layouts && available.len() == 1
+               && (was_cycle_member || in_sync_group) {
+                handler.to_gui.send(ToGui::ForceReloadLayout(
+                    available[0], ForceReloadReason::SyncGroup)).unwrap();
+            }
+        }
+
+        assert!(togui_rx.try_recv().is_err(),
+                "a Sync Group role configured with no override currently active must not \
+                 force-reload an ordinary single-layout schedule");
     }
 }
 
