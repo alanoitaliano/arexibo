@@ -3,6 +3,7 @@
 
 #include <functional>
 #include <memory>
+#include <unistd.h>
 #include <QMainWindow>
 #include <QScreen>
 #include <QMap>
@@ -96,7 +97,16 @@ public:
                        << "(status=" << static_cast<int>(status) << ", exitCode=" << exitCode
                        << ") -- exiting so systemd (Restart=always) can start a fresh instance"
                        << std::endl;
-            std::exit(1);
+            // _exit, not std::exit: skips atexit handlers/static
+            // destructors entirely -- found plausible from a real
+            // report ("does not rotate" + Chromium's own
+            // "Error sending sync broker message: Broken pipe" in the
+            // log): std::exit() runs Chromium's own atexit-registered
+            // cleanup, which could itself hang trying to talk to the
+            // very renderer that just died over the same broken IPC
+            // pipe. The process is already considered unsalvageable
+            // here regardless, so there's nothing worth waiting on.
+            _exit(1);
         });
 
         // A failed page load (network timeout, DNS hiccup) otherwise

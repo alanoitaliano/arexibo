@@ -97,6 +97,8 @@ pub fn run(settings: PlayerSettings, screen: String, inspect: bool, debug: bool,
                             "purge-triggered reload",
                         ForceReloadReason::CycleGroupOfOne =>
                             "Cycle Playback group of one completed its own natural cycle",
+                        ForceReloadReason::SingleLayoutLoop =>
+                            "single layout, all regions non-looping, restarting it",
                     };
                     log::info!("force-reloading layout {layout_id} ({why})");
                     let file = CString::new(format!("{layout_id}.xlf.html")).unwrap();

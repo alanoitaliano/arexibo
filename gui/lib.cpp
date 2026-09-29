@@ -460,6 +460,14 @@ void run() {
 
 void quit() {
     if (!the_app) return;
+    // Explicitly destroying every QWebEngineView (via the_wnd's own
+    // Qt child-object cascade) while the event loop is still running
+    // -- found from a real report: QApplication::quit() alone leaves
+    // Chromium's own per-view render/GPU threads torn down abruptly at
+    // process exit instead, causing a real, reproducible
+    // "QThreadStorage: entry destroyed before end of thread" on exit.
+    delete the_wnd;
+    the_wnd = nullptr;
     the_app->quit();
 }
 

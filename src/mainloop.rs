@@ -119,6 +119,11 @@ pub enum ForceReloadReason {
     /// group of exactly one member -- its own play count still needs
     /// this signal to advance, even with nowhere else to advance to.
     CycleGroupOfOne,
+    /// Every region in this layout has loop disabled and finished its
+    /// own single pass -- nothing else would ever restart it (see
+    /// status doc: LayoutCompleted only fires when *all* regions are
+    /// frozen this way).
+    SingleLayoutLoop,
 }
 
 pub enum Kill {
@@ -1288,14 +1293,19 @@ impl Handler {
                                 .filter(|&id| self.cache.get_layout(id).is_some())
                                 .collect();
                             if available == self.layouts && available.len() == 1
-                               && (was_cycle_member || in_sync_group) {
+                               && (was_cycle_member || in_sync_group
+                                   || !self.schedule.is_showing_only_the_default(&self.criteria)) {
+                                let reason = if was_cycle_member {
+                                    ForceReloadReason::CycleGroupOfOne
+                                } else if in_sync_group {
+                                    ForceReloadReason::SyncGroup
+                                } else {
+                                    ForceReloadReason::SingleLayoutLoop
+                                };
                                 log::info!("layout {} completed its own natural cycle -- \
-                                            reloading it fresh ({})", available[0],
-                                           if was_cycle_member { "Cycle Playback group of one" }
-                                           else { "Sync Group" });
-                                self.to_gui.send(ToGui::ForceReloadLayout(available[0],
-                                    if was_cycle_member { ForceReloadReason::CycleGroupOfOne }
-                                    else { ForceReloadReason::SyncGroup })).unwrap();
+                                            reloading it fresh ({reason:?})", available[0]);
+                                self.to_gui.send(ToGui::ForceReloadLayout(
+                                    available[0], reason)).unwrap();
                             } else if available != self.layouts {
                                 // A cycle group just advanced to a
                                 // genuinely different member (its own
@@ -4744,13 +4754,12 @@ mod handle_trigger_code_tests {
     }
 
     #[test]
-    fn layout_completed_does_not_reload_an_ordinary_single_layout_schedule() {
-        // Real report (GitHub issue #1): an ordinary single-layout
-        // schedule (no Cycle Playback, no Sync Group) must keep
-        // looping seamlessly via its own GUI-side timers, exactly like
-        // 0.6.0 -- no forced page reload/re-fetch of every asset on
-        // every completed cycle. Simulated here the same way the other
-        // tests in this module already do.
+    fn layout_completed_reloads_an_ordinary_single_layout_schedule() {
+        // A genuine, single scheduled layout (not the CMS's own
+        // default fallback) must still be reloaded when it completes
+        // -- LayoutCompleted only fires once every region has frozen
+        // (loop disabled), meaning nothing else would ever restart it
+        // otherwise (see status doc for the full history/reasoning).
         let port = start_mock_ready();
         let cms = test_cms_settings(port);
         let envdir = test_envdir();
@@ -4770,6 +4779,7 @@ mod handle_trigger_code_tests {
         handler.schedule = Schedule::parse(&tree).unwrap();
         handler.cache.insert_fake_layout_for_test(913);
         handler.layouts = vec![913];
+        handler.current_layout = 913;
         assert_eq!(handler.settings.sync_role, SyncRole::None,
                    "this scenario only makes sense with no active Sync Group");
         while togui_rx.try_recv().is_ok() {} // drain any startup messages
@@ -4788,14 +4798,71 @@ mod handle_trigger_code_tests {
                 .filter(|&id| handler.cache.get_layout(id).is_some())
                 .collect();
             if available == handler.layouts && available.len() == 1
-               && (was_cycle_member || in_sync_group) {
+               && (was_cycle_member || in_sync_group
+                   || !handler.schedule.is_showing_only_the_default(&handler.criteria)) {
                 handler.to_gui.send(ToGui::ForceReloadLayout(
-                    available[0], ForceReloadReason::CycleGroupOfOne)).unwrap();
+                    available[0], ForceReloadReason::SingleLayoutLoop)).unwrap();
+            }
+        }
+
+        let msg = togui_rx.try_recv().expect("a genuinely scheduled single layout must reload");
+        assert!(matches!(msg, ToGui::ForceReloadLayout(913, ForceReloadReason::SingleLayoutLoop)),
+                "must be force-reloaded with the SingleLayoutLoop reason");
+    }
+
+    #[test]
+    fn layout_completed_does_not_reload_a_default_only_layout() {
+        // Distinct from the test above: with *no* active schedule
+        // entry at all (only the CMS's own default layout showing as
+        // a fallback), the real report was clear -- this must keep
+        // looping via its own internal region timers, no forced
+        // reload.
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+
+        // No <layout> entry at all -- only <default>.
+        let xml = r#"<schedule generated="2026-01-01 00:00:00" filterFrom="2026-01-01 00:00:00" filterTo="2026-01-02 00:00:00">
+  <default file="913" duration="60"/>
+</schedule>"#;
+        let tree = elementtree::Element::from_reader(xml.as_bytes()).unwrap();
+        handler.schedule = Schedule::parse(&tree).unwrap();
+        handler.cache.insert_fake_layout_for_test(913);
+        handler.layouts = vec![913];
+        handler.current_layout = 913;
+        assert!(handler.schedule.is_showing_only_the_default(&handler.criteria),
+                "this scenario only makes sense with no genuinely active schedule entry");
+        while togui_rx.try_recv().is_ok() {} // drain any startup messages
+
+        if handler.override_revert_on_completion && handler.override_layout.take().is_some() {
+            handler.override_revert_on_completion = false;
+            handler.schedule_check();
+        } else if handler.override_layout.is_none() {
+            let was_cycle_member = handler.schedule.record_cycle_group_completion(
+                handler.current_layout, &handler.criteria, &mut handler.cycle_state);
+            let in_sync_group = handler.sync_layout_active;
+            let resolved = handler.schedule.layouts_now(&handler.criteria, &mut handler.cycle_state);
+            let available: Vec<_> = resolved.iter().copied()
+                .filter(|&id| handler.cache.get_layout(id).is_some())
+                .collect();
+            if available == handler.layouts && available.len() == 1
+               && (was_cycle_member || in_sync_group
+                   || !handler.schedule.is_showing_only_the_default(&handler.criteria)) {
+                handler.to_gui.send(ToGui::ForceReloadLayout(
+                    available[0], ForceReloadReason::SingleLayoutLoop)).unwrap();
             }
         }
 
         assert!(togui_rx.try_recv().is_err(),
-                "an ordinary single-layout schedule must not be force-reloaded");
+                "a default-only fallback layout must not be force-reloaded -- it keeps \
+                 looping via its own internal region timers");
     }
 
     #[test]
@@ -4850,9 +4917,12 @@ mod handle_trigger_code_tests {
     }
 
     #[test]
-    fn layout_completed_does_not_reload_when_sync_role_is_set_but_no_override_is_active() {
-        // sync_role alone is too broad -- only sync_layout_active
-        // (a genuine active override) should count.
+    fn layout_completed_uses_the_right_reason_when_sync_role_is_set_but_no_override_is_active() {
+        // sync_role alone is too broad for the log *reason* -- only
+        // sync_layout_active (a genuine active override) should count
+        // as "Sync Group" there. The reload itself still happens
+        // either way (a genuine schedule entry, not the default), just
+        // logged as SingleLayoutLoop instead of SyncGroup here.
         let port = start_mock_ready();
         let cms = test_cms_settings(port);
         let envdir = test_envdir();
@@ -4894,15 +4964,19 @@ mod handle_trigger_code_tests {
                 .filter(|&id| handler.cache.get_layout(id).is_some())
                 .collect();
             if available == handler.layouts && available.len() == 1
-               && (was_cycle_member || in_sync_group) {
-                handler.to_gui.send(ToGui::ForceReloadLayout(
-                    available[0], ForceReloadReason::SyncGroup)).unwrap();
+               && (was_cycle_member || in_sync_group
+                   || !handler.schedule.is_showing_only_the_default(&handler.criteria)) {
+                let reason = if was_cycle_member { ForceReloadReason::CycleGroupOfOne }
+                             else if in_sync_group { ForceReloadReason::SyncGroup }
+                             else { ForceReloadReason::SingleLayoutLoop };
+                handler.to_gui.send(ToGui::ForceReloadLayout(available[0], reason)).unwrap();
             }
         }
 
-        assert!(togui_rx.try_recv().is_err(),
-                "a Sync Group role configured with no override currently active must not \
-                 force-reload an ordinary single-layout schedule");
+        let msg = togui_rx.try_recv().expect("a genuinely scheduled single layout must reload");
+        assert!(matches!(msg, ToGui::ForceReloadLayout(913, ForceReloadReason::SingleLayoutLoop)),
+                "must reload (genuine schedule entry), but logged as SingleLayoutLoop, not \
+                 SyncGroup, since no override is actually active");
     }
 }
 

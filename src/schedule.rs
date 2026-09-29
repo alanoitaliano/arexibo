@@ -503,6 +503,25 @@ impl Schedule {
     /// now: a cycle-group entry that's *also* an Interrupt Layout
     /// (`share_of_voice > 0`) isn't specially handled, a known,
     /// documented gap (an unusual combination in practice).
+    /// True if `layouts_now()`'s own current resolution has no
+    /// genuinely active schedule entry at all right now (mirrors its
+    /// own `active` construction) -- i.e. it would only be showing
+    /// something because of the `self.default` fallback, not a real
+    /// schedule match.
+    pub fn is_showing_only_the_default(&self, criteria: &CriteriaStore) -> bool {
+        let now = OffsetDateTime::now_local().unwrap();
+        let cycle_groups = self.active_cycle_groups(now, criteria);
+        if !cycle_groups.is_empty() {
+            return false;
+        }
+        let cycle_members: std::collections::HashSet<(i64, LayoutId)> = cycle_groups.iter()
+            .flat_map(|(&gk, members)| members.iter().map(move |m| (gk, m.layoutid)))
+            .collect();
+        !self.schedules.iter().any(|e| e.from <= now && now <= e.to
+                                        && self.criteria_satisfied(e, criteria)
+                                        && !cycle_members.contains(&(e.group_key, e.layoutid)))
+    }
+
     pub fn layouts_now(&self, criteria: &CriteriaStore, cycle_state: &mut CycleState) -> Vec<LayoutId> {
         let now = OffsetDateTime::now_local().unwrap();
         let cycle_groups = self.active_cycle_groups(now, criteria);
