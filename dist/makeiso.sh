@@ -61,6 +61,31 @@ done
 TOTEM_PASSWORD_HASH=$(openssl passwd -6 -stdin <<< "$TOTEM_PASSWORD")
 unset TOTEM_PASSWORD TOTEM_PASSWORD_CONFIRM
 
+# ==== 3a. Optional "tecnici" support account (network config only, no ====
+# ====     other sudo access -- see the sudoers rule this generates) ====
+read -rp "Create a separate support account for network configuration \
+(limited sudo, no other access)? [Y/n]: " TECNICI_ANSWER
+ENABLE_TECNICI=1
+[[ "$TECNICI_ANSWER" =~ ^[nN] ]] && ENABLE_TECNICI=0
+
+if [ "$ENABLE_TECNICI" -eq 1 ]; then
+  read -rp "Support account username [default: tecnici]: " TECNICI_USERNAME
+  TECNICI_USERNAME="${TECNICI_USERNAME:-tecnici}"
+  [[ "$TECNICI_USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]] || {
+    echo "ERROR: invalid username (lowercase letters/digits/-/_ only, can't start with a digit)."
+    exit 1
+  }
+
+  while true; do
+    read -rsp "Support account password: " TECNICI_PASSWORD; echo
+    read -rsp "Confirm password: " TECNICI_PASSWORD_CONFIRM; echo
+    [ "$TECNICI_PASSWORD" = "$TECNICI_PASSWORD_CONFIRM" ] && break
+    echo "The two passwords don't match, try again."
+  done
+  TECNICI_PASSWORD_HASH=$(openssl passwd -6 -stdin <<< "$TECNICI_PASSWORD")
+  unset TECNICI_PASSWORD TECNICI_PASSWORD_CONFIRM
+fi
+
 # ==== 3b. Keyboard layout, timezone, screen orientation ====
 read -rp "Keyboard layout [default: it]: " KEYBOARD_LAYOUT
 KEYBOARD_LAYOUT="${KEYBOARD_LAYOUT:-it}"
@@ -451,38 +476,42 @@ autoinstall:
       EOF
     - chmod 755 /target/usr/local/sbin/totem-net-config
 
-    # "tecnici" user: SSH access for network configuration only. Can run
-    # in sudo EXCLUSIVELY /usr/local/sbin/totem-net-config, no other
-    # command. Not added to the sudo/admin group: the permission comes
-    # solely from the dedicated sudoers rule below, so it has no generic
-    # sudo access in any other way.
+    # TECNICI_BLOCK_START -- makeiso.sh removes everything between
+    # here and TECNICI_BLOCK_END if this support account was declined.
+    #
+    # "__TECNICI_USERNAME__" user: SSH access for network configuration
+    # only. Can run in sudo EXCLUSIVELY /usr/local/sbin/totem-net-config,
+    # no other command. Not added to the sudo/admin group: the
+    # permission comes solely from the dedicated sudoers rule below, so
+    # it has no generic sudo access in any other way.
     #
     # NOTE: sudo by default requires the password of the user CALLING
-    # sudo (tecnici itself), not root's. The tecnici user will use their
-    # own password both for SSH login and for sudo authentication.
+    # sudo (this account itself), not root's. It will use its own
+    # password both for SSH login and for sudo authentication.
     #
     # NOTE 2: this rule only limits privilege escalation to root, not the
-    # user's own shell: with a normal bash shell, tecnici can still browse
+    # user's own shell: with a normal bash shell, it can still browse
     # the filesystem and run unprivileged commands. If tighter confinement
     # is needed (e.g. a login that only runs the script then disconnects),
     # it needs to be added separately by changing the login shell.
-    - curtin in-target -- useradd -m -s /bin/bash -p '$6$a56b7f97374c4b59$ysD5mVK3EeNV1zhjlRe/Jf5/KbwZjdj9V2pfN2jFfD7ahfHaH2T6KO5Pz4FTvmSAMTUIfHcQkMvTS.fXGacqX0' tecnici
+    - curtin in-target -- useradd -m -s /bin/bash -p '__TECNICI_PASSWORD_HASH__' __TECNICI_USERNAME__
     - |
       cat << 'EOF' > /target/etc/sudoers.d/tecnici-totem-net
-      # Sudo commands allowed for the tecnici user (contracted
+      # Sudo commands allowed for this support account (contracted
       # maintainers). Each line is one specific command, not generic
       # sudo. Do not add "ALL" or overly broad wildcards without
       # evaluating the implications: each line below was chosen because
       # it's limited to one precise action, even where it uses a
       # trailing asterisk.
-      tecnici ALL=(root) /usr/local/sbin/totem-net-config
-      tecnici ALL=(root) /usr/sbin/reboot
-      tecnici ALL=(root) /usr/bin/systemctl restart arexibo.service
-      tecnici ALL=(root) /usr/bin/systemctl status arexibo.service
-      tecnici ALL=(root) /usr/bin/journalctl -u arexibo.service *
+      __TECNICI_USERNAME__ ALL=(root) /usr/local/sbin/totem-net-config
+      __TECNICI_USERNAME__ ALL=(root) /usr/sbin/reboot
+      __TECNICI_USERNAME__ ALL=(root) /usr/bin/systemctl restart arexibo.service
+      __TECNICI_USERNAME__ ALL=(root) /usr/bin/systemctl status arexibo.service
+      __TECNICI_USERNAME__ ALL=(root) /usr/bin/journalctl -u arexibo.service *
       EOF
     - chmod 440 /target/etc/sudoers.d/tecnici-totem-net
     - curtin in-target -- visudo -cf /etc/sudoers.d/tecnici-totem-net
+    # TECNICI_BLOCK_END
 
     # XORG CONFIGURATION (detected GPU driver + TearFree where supported)
     - mkdir -p /target/etc/X11/xorg.conf.d
@@ -1132,6 +1161,14 @@ if [ "$ENABLE_WIREGUARD" -eq 0 ]; then
   sed -i '/^[[:space:]]*wireguard \\$/d; /^[[:space:]]*jq \\$/d' "$GENERATED_USER_DATA"
 fi
 
+if [ "$ENABLE_TECNICI" -eq 1 ]; then
+  sed -i "s|__TECNICI_USERNAME__|${TECNICI_USERNAME}|g" "$GENERATED_USER_DATA"
+  sed -i "s|__TECNICI_PASSWORD_HASH__|${TECNICI_PASSWORD_HASH}|" "$GENERATED_USER_DATA"
+else
+  echo "=== Support account declined: removing its block from user-data ==="
+  sed -i '/# TECNICI_BLOCK_START/,/# TECNICI_BLOCK_END/d' "$GENERATED_USER_DATA"
+fi
+
 # ==== 6. Remaster the ISO ====
 ORIG_VOLID=$(xorriso -indev "$ISO_IN" -p2df 2>&1 | grep "Volume id" | cut -d"'" -f2 || true)
 if [ -z "$ORIG_VOLID" ]; then
@@ -1193,5 +1230,6 @@ xorriso -as mkisofs -r \
 
 echo "ISO created: $ISO_OUT"
 echo "User: $TOTEM_USERNAME  WireGuard VPN: $([ "$ENABLE_WIREGUARD" -eq 1 ] && echo enabled || echo disabled)"
+echo "Support account: $([ "$ENABLE_TECNICI" -eq 1 ] && echo "$TECNICI_USERNAME" || echo "none")"
 echo "Keyboard: $KEYBOARD_LAYOUT  Timezone: $TIMEZONE  Orientation: $([ -n "$SCREEN_ROTATE_OPTION" ] && echo portrait || echo landscape)"
 echo "Xibo registration: $([ -n "$XIBO_REGISTER_LINE" ] && echo "automatic on $XIBO_HOST" || echo "Register via Code (no URL/key provided)")"
