@@ -311,22 +311,67 @@ void setup(const char *base_uri, const char *screen, int inspect, int debug,
                 document.documentElement.style.overflowY = 'hidden';
                 // Native PDF widget: already fits itself correctly.
                 if (document.getElementById('the-canvas')) return;
+                // A degenerate transform/size (Infinity/NaN, from a CMS
+                // template calling xiboLayoutScaler with
+                // originalWidth/Height missing or 0 -- division by
+                // zero) isn't a legitimate prior scale to defer to --
+                // reset it and let this script's own correction below
+                // proceed instead of backing off.
+                function isDegenerate(transformStr) {
+                    return /infinity|nan/i.test(transformStr);
+                }
                 // Some widget already got a transform of its own
                 // (e.g. webpage Best Fit) -- don't scale it again.
+                // Checks body itself too, not just descendants --
+                // xiboLayoutScaler's own target can legitimately be
+                // body itself.
                 var alreadyScaledByCms = false;
-                var candidates = body.querySelectorAll('*');
-                for (var ci = 0; ci < candidates.length; ci++) {
-                    if (candidates[ci].style && candidates[ci].style.transform) {
+                var scaledEl = null;
+                if (body.style && body.style.transform) {
+                    if (isDegenerate(body.style.transform)) {
+                        body.style.transform = '';
+                        body.style.width = '';
+                        body.style.height = '';
+                    } else {
                         alreadyScaledByCms = true;
+                        scaledEl = body;
+                    }
+                }
+                if (!alreadyScaledByCms) {
+                    var candidates = body.querySelectorAll('*');
+                    for (var ci = 0; ci < candidates.length; ci++) {
+                        var candStyle = candidates[ci].style;
+                        if (!candStyle || !candStyle.transform) continue;
+                        if (isDegenerate(candStyle.transform)) {
+                            candStyle.transform = '';
+                            candStyle.width = '';
+                            candStyle.height = '';
+                            continue;
+                        }
+                        alreadyScaledByCms = true;
+                        scaledEl = candidates[ci];
                         break;
                     }
                 }
-                if (alreadyScaledByCms) return;
+                if (alreadyScaledByCms) {
+                    if (window.arexiboDebug) {
+                        console.log('arexibo-shrink: target=' + w + 'x' + h +
+                                    ' -- skipped, ' + scaledEl.tagName + '.' + scaledEl.className +
+                                    ' already has transform="' + scaledEl.style.transform + '"');
+                    }
+                    return;
+                }
                 body.style.transform = '';
                 document.documentElement.style.maxWidth = w + 'px';
                 var sw = body.scrollWidth, sh = body.scrollHeight;
                 if (sw <= 0 || sh <= 0) return;
-                var scale = Math.min(1, w / sw, h / sh);
+                var scale = Math.min(1, w / sw);
+                // Height alone overflowing isn't corrected here (left
+                // to overflow-clip above) -- a template whose static
+                // header isn't accounted for in its own declared
+                // height would otherwise always shrink width too, even
+                // though width already fits exactly. Matches the other
+                // Xibo clients' own observed behavior for this case.
                 // A marquee/ticker plugin duplicates its own content
                 // several times to scroll seamlessly, producing
                 // scrollWidth in the ~1,000,000px range -- an
