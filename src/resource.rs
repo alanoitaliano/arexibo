@@ -799,18 +799,36 @@ impl Cache {
     }
 
     /// Stops tracking (and polling GetData for) any data widget whose
-    /// own layout isn't in `active_layouts` -- confirmed from a real
-    /// report: a layout can simply stop being scheduled (e.g. outside
-    /// its own time window) without the CMS ever purging its resource,
-    /// so `purge`/`purge_some` alone don't catch this case. Without
-    /// this, GetData kept being called forever for widgets belonging
-    /// to no-longer-active layouts, each failing with a real "Requested
-    /// an invalid file" SOAP fault -- harmless (the existing backoff,
-    /// see `last_attempt_failed_at`'s own doc comment, already prevents
-    /// a tight retry loop) but genuinely pointless network traffic and
-    /// log noise that would otherwise continue indefinitely.
+    /// own layout isn't in `active_layouts` AND is no longer cached at
+    /// all -- confirmed from a real report: a layout can simply stop
+    /// being scheduled (e.g. outside its own time window) without the
+    /// CMS ever purging its resource, so `purge`/`purge_some` alone
+    /// don't catch this case. Without this, GetData kept being called
+    /// forever for widgets belonging to no-longer-active layouts, each
+    /// failing with a real "Requested an invalid file" SOAP fault --
+    /// harmless (the existing backoff, see `last_attempt_failed_at`'s
+    /// own doc comment, already prevents a tight retry loop) but
+    /// genuinely pointless network traffic and log noise that would
+    /// otherwise continue indefinitely.
+    ///
+    /// The "still cached" half of this check matters for a real,
+    /// separate case: a layout reached only via a Navigate Layout
+    /// action (a touch/webhook jump, or the Previous/Next buttons) --
+    /// never part of `active_layouts` at all (that only ever reflects
+    /// the resolved *schedule*, since the GUI-side jump never tells
+    /// mainloop.rs about it) but perfectly valid and just downloaded.
+    /// Without this, its own data widgets were pruned the moment the
+    /// very next schedule_check() ran (right after discovery), so a
+    /// display with no schedule entries at all -- a single default
+    /// layout with Navigate Layout buttons to the rest -- never
+    /// actually polled GetData for any of those other layouts' own
+    /// data widgets at all, even while the user was actively looking
+    /// at one of them.
     pub fn prune_data_widgets_not_in(&mut self, active_layouts: &[LayoutId]) {
-        self.data_widgets.retain(|_, s| active_layouts.contains(&s.layoutid));
+        let content = &self.content;
+        self.data_widgets.retain(|_, s| active_layouts.contains(&s.layoutid)
+                                         || matches!(content.get(&format!("{}.xlf", s.layoutid)),
+                                                      Some(Resource::Layout(_))));
     }
 
     /// Whether `widget_id` is one we're independently polling via
@@ -1921,6 +1939,36 @@ mod data_widget_polling_tests {
 
         assert_eq!(cache.data_widgets_due(Instant::now()), vec![4543],
                    "must not prune a widget whose own layout is still active");
+    }
+
+    #[test]
+    fn prune_keeps_tracking_a_widget_whose_layout_is_cached_but_not_scheduled() {
+        // Real report: a display with no schedule entries at all (just
+        // a default layout with Navigate Layout buttons to the rest)
+        // only ever has that one default layout in active_layouts --
+        // every other layout reached via navigation was pruned the
+        // moment the next schedule_check() ran, right after being
+        // freshly discovered, so GetData was never actually polled for
+        // any of them even while the user was looking right at one.
+        // A layout still present in the cache (just downloaded, or
+        // never purged) must be treated as active regardless of
+        // whether it's in the resolved schedule.
+        let (mut cache, dir) = make_cache();
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940);
+        let fname = "940.xlf".to_string();
+        fs::write(dir.join(&fname), "<layout/>").unwrap();
+        cache.content.insert(fname, Resource::Layout(Arc::new(LayoutInfo {
+            id: 940, md5: vec![], size: (1080, 1920), code: None,
+            enable_stat: true, translated_version: TRANSLATOR_VERSION, sync_keys: vec![],
+        })));
+
+        // 940 isn't in the resolved schedule at all (only 947, the
+        // actual default, is) -- but it's still cached.
+        cache.prune_data_widgets_not_in(&[947]);
+
+        assert_eq!(cache.data_widgets_due(Instant::now()), vec![4543],
+                   "must not prune a widget whose own layout is still cached, even if \
+                    it's not part of the resolved schedule");
     }
 
     #[test]
