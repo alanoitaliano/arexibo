@@ -1,12 +1,12 @@
 [package]
 name = "arexibo"
 description = "A client (player) for the Xibo signage system"
-version = "0.6.2"
+version = "0.6.3"
 rust-version = "1.75"
 edition = "2021"
-authors = ["Georg Brandl <g.brandl@fz-juelich.de>", "Romolo Manfredini <romolo.manfredini@gmail.com>"]
+authors = ["Georg Brandl <g.brandl@fz-juelich.de>"]
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/romoloman/arexibo"
+repository = "https://github.com/birkenfeld/arexibo"
 keywords = ["xibo", "signage", "qt"]
 
 [[bin]]

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.0 - upcoming
+## 0.6.3 - Oct 2026
 
 - Fix `--allow-offline` exiting the process anyway when XMR setup fails
   on a genuinely unreachable network; retries XMR automatically once
@@ -31,6 +31,44 @@
   from every frame, plus a couple of internal state logs useful for
   troubleshooting a "content renders but isn't visible" widget.
 - Customizable startup splash screen (logo + text).
+- Add a loading watchdog for native ("Open Natively") webpage widgets:
+  force-stops a page stuck with no load progress for 15s, so one
+  unreachable/slow external site can't hang the whole layout.
+- Treat a webpage widget's own `duration` of `0` or unset as "as long
+  as the layout", instead of collapsing to 1 second.
+- Splash screen now shows one of three distinct statuses instead of a
+  single generic "LOADING...": "REGISTERING TO CMS..." while
+  registered but not yet authorized, and "WAITING FOR CMS
+  CONNECTION..." while genuinely unreachable (with no cache, or with
+  the new `--disallow-offline`).
+- `--allow-offline`'s own behaviour (fall back to a cached schedule
+  instead of exiting) is now the default; the flag is still accepted
+  but now does nothing, only so existing scripts don't break. Add
+  `--disallow-offline` for the old, strict behaviour.
+- A display that loses its connection mid-session (not just at
+  startup) now falls back to the splash screen after 3 consecutive
+  failed collection cycles, instead of silently cycling stale content
+  forever with no indication anything's wrong.
+- Fix a Sync Group reload being force-triggered (and misleadingly
+  logged as "Sync Group") for a display that merely has a Sync Group
+  role configured, even with no Sync Group Command actually active.
+- Fix a rare crash right after completing registration
+  (`QThreadStorage: entry ... destroyed before end of thread`): the
+  main window (and every native web view) is now torn down explicitly
+  before quitting, instead of being abandoned mid-event-loop.
+- A renderer process crash now force-exits immediately, instead of
+  risking a hang in Chromium's own exit-time cleanup trying to reach
+  the very process that just crashed.
+- Fix a shrink-to-fit sizing bug: a widget whose own width was already
+  correct could still get squeezed narrower than intended to
+  compensate for unrelated vertical overflow (e.g. a template's own
+  static header not accounted for in its declared height); only width
+  overflow is corrected now, height overflow is left to clip as
+  before, matching the other official Xibo players' own behaviour.
+- Fix DataSet/"Elements" widgets never receiving their data (GetData)
+  when their own layout is only reachable via a Navigate Layout action
+  (not part of the resolved schedule itself) -- their own tracking was
+  being dropped again right after being discovered.
 
 ## 0.5.1 - upcoming
 
