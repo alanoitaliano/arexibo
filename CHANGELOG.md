@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.4 - Oct 2026
+
+- Fix DataSet/"Elements" widgets never receiving their data (GetData)
+  when their own layout is reached only via a Navigate Layout action
+  and genuinely no longer served by the CMS at all: a layout can be
+  replaced/removed without the CMS ever sending an explicit purge
+  directive for it, leaving the display polling GetData forever for
+  widgets that will never succeed. The CMS's own RequiredFiles
+  response always lists every currently-needed layout regardless of
+  whether it needs downloading, so a cached layout missing from that
+  list (along with its own widget resources) is now removed just as
+  authoritatively as an explicit purge, without ever guessing from
+  repeated GetData failures (the CMS can take several minutes to
+  materialize a dataset's own cache after a bulk collectNow, during
+  which a genuinely valid widget could otherwise be pruned by mistake).
+- Fix the CMS explicitly purging a layout not also stopping GetData
+  polling for its own widgets (only purging the widget's own resource
+  directly did).
+- Log every file actually purged (and how many of its own data widgets
+  stopped being tracked as a result) -- previously silent on success.
+
 ## 0.6.3 - Oct 2026
 
 - Fix `--allow-offline` exiting the process anyway when XMR setup fails
