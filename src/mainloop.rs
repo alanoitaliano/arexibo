@@ -1626,10 +1626,28 @@ impl Handler {
         }
 
         // get the missing files
-        let (required, purge) = self.xmds.required_files()?;
+        let (required, mut purge) = self.xmds.required_files()?;
 
         // update layout code map
         self.cache.update_code_map(&required)?;
+
+        // RequiredFiles always lists every currently-needed layout
+        // (already-cached ones too, just skipped from actually
+        // downloading below), so a cached layout missing from this
+        // list is stale even without an explicit CMS purge directive
+        // for it -- see stale_layout_keys's own doc comment.
+        let required_layout_ids: std::collections::HashSet<i64> = required.iter()
+            .filter_map(|f| match f {
+                ReqFile::File { typ: "layout", id, .. } => Some(*id),
+                _ => None
+            })
+            .collect();
+        let stale_layouts = self.cache.stale_layout_keys(&required_layout_ids);
+        if !stale_layouts.is_empty() {
+            log::info!("layout(s) no longer in RequiredFiles, removing along with their own \
+                        widgets/data (no explicit CMS purge needed): {}", stale_layouts.join(", "));
+        }
+        purge.extend(stale_layouts);
 
         // purge files
         if let Err(e) = self.cache.purge_some(&purge) {

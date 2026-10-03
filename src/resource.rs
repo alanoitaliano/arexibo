@@ -746,6 +746,42 @@ impl Cache {
         }
     }
 
+    /// Every cached layout (`Resource::Layout` entry) whose own id
+    /// isn't in `required_layout_ids`, *and* every one of its own
+    /// `Resource::Resource` widget resources (matched by their own
+    /// `layoutid`, not just the bare layout file) -- meant to be merged
+    /// into the explicit CMS purge list before calling `purge_some`,
+    /// right after a fresh `required_files()` call. Confirmed real: a
+    /// layout can be replaced/removed on the CMS without an explicit
+    /// purge directive ever being sent for it OR for its own widget
+    /// resources, but RequiredFiles always lists every currently-needed
+    /// layout regardless of whether it needs downloading (already-
+    /// cached ones are listed too, just skipped locally) -- so its own
+    /// absence from that list is just as authoritative as an explicit
+    /// purge, without having to guess from repeated GetData failures
+    /// (tried and rejected: the CMS can take several minutes to
+    /// materialize a dataset's own cache after a bulk collectNow,
+    /// during which a genuinely valid widget can keep failing with
+    /// "Requested an invalid file" far longer than any short
+    /// retry-count margin would tolerate without a false prune).
+    pub fn stale_layout_keys(&self, required_layout_ids: &std::collections::HashSet<LayoutId>)
+                              -> Vec<String> {
+        let stale_ids: std::collections::HashSet<LayoutId> = self.content.values()
+            .filter_map(|resource| match resource {
+                Resource::Layout(info) if !required_layout_ids.contains(&info.id) =>
+                    Some(info.id),
+                _ => None
+            })
+            .collect();
+        self.content.iter()
+            .filter_map(|(key, resource)| match resource {
+                Resource::Layout(info) if stale_ids.contains(&info.id) => Some(key.clone()),
+                Resource::Resource(info) if stale_ids.contains(&info.layoutid) => Some(key.clone()),
+                _ => None
+            })
+            .collect()
+    }
+
     pub fn purge_some(&mut self, list: &[String]) -> Result<()> {
         let mut changed = false;
         for name in list {
@@ -754,7 +790,7 @@ impl Cache {
             // block deletion), and independently per-file (one failure
             // no longer aborts the whole batch via `?`).
             match fs::remove_file(self.dir.join(name)) {
-                Ok(()) => changed = true,
+                Ok(()) => { changed = true; log::info!("purged {name}"); }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     // Already gone (or never downloaded) -- the common,
                     // unremarkable case, not worth a log line.
@@ -765,14 +801,34 @@ impl Cache {
                 changed = true;
                 // A purged resource might have been the container for
                 // tracked data widgets (v7 GetData polling, see
-                // data_widgets's own doc comment) -- covers the case
-                // of an explicit CMS purge specifically. A layout
-                // simply falling out of the current schedule *without*
-                // being purged is a separate case, handled instead by
-                // prune_data_widgets_not_in (called from
-                // mainloop.rs's own schedule_check).
-                if let Resource::Resource(info) = &removed {
-                    self.data_widgets.retain(|_, s| s.resource_id != info.id);
+                // data_widgets's own doc comment). Covers both an
+                // explicit CMS purge directive and a layout simply
+                // missing from the latest required_files() response
+                // (see stale_layout_keys, called from mainloop.rs
+                // right before this with its own result merged into
+                // the purge list -- RequiredFiles always lists every
+                // currently-needed layout, whether it needs downloading
+                // or not, so absence from it is as authoritative as an
+                // explicit purge).
+                let before = self.data_widgets.len();
+                match &removed {
+                    Resource::Resource(info) =>
+                        self.data_widgets.retain(|_, s| s.resource_id != info.id),
+                    // The CMS explicitly purging the *layout* itself is
+                    // just as authoritative as purging one of its own
+                    // widget resources directly -- stop tracking every
+                    // data widget that belonged to it immediately,
+                    // rather than waiting for each one to separately
+                    // fail GetData with its own "Requested an invalid
+                    // file" fault later.
+                    Resource::Layout(info) =>
+                        self.data_widgets.retain(|_, s| s.layoutid != info.id),
+                    _ => {}
+                }
+                let dropped = before - self.data_widgets.len();
+                if dropped > 0 {
+                    log::info!("{name} purged -- also stopped tracking {dropped} of its own \
+                                data widget(s)");
                 }
             }
         }
@@ -905,6 +961,21 @@ impl Cache {
                 Ok(resource_id)
             }
             Err(e) => {
+                // Deliberately NOT pruning on "Requested an invalid
+                // file" (or any other fault text) here -- tried twice
+                // (a direct re-check against our own cached resource,
+                // then the fault text itself with a 2-strikes safety
+                // margin) and rejected both times: confirmed via a real
+                // report, the CMS can take several minutes to
+                // materialize a dataset's own view/cache after a bulk
+                // collectNow, during which a genuinely valid, brand-new
+                // widget can keep failing with this exact fault for far
+                // longer than any short retry-count margin would
+                // tolerate without risking a false prune. Ground truth
+                // (the CMS explicitly purging the layout/widget, see
+                // purge_some) is the only mechanism trusted to stop
+                // tracking a widget -- this failure path only backs off
+                // and retries, same as any other kind of failure.
                 if let Some(state) = self.data_widgets.get_mut(&widget_id) {
                     state.last_attempt_failed_at = Some(now);
                 }
@@ -1699,6 +1770,66 @@ mod data_widget_polling_tests {
     }
 
     #[test]
+    fn purge_some_stops_tracking_every_widget_whose_layout_was_purged() {
+        // The CMS explicitly purging the layout itself is just as
+        // authoritative as purging one of its own widget resources
+        // directly -- don't wait for each data widget to separately
+        // fail GetData later.
+        let (mut cache, _dir) = make_cache();
+        cache.content.insert("940.xlf".to_string(), Resource::Layout(Arc::new(LayoutInfo {
+            id: 940, md5: vec![], size: (1080, 1920), code: None,
+            enable_stat: true, translated_version: TRANSLATOR_VERSION, sync_keys: vec![],
+        })));
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940);
+        assert_eq!(cache.data_widgets_due(Instant::now()), vec![4543]);
+
+        cache.purge_some(&["940.xlf".to_string()]).unwrap();
+
+        assert!(cache.data_widgets_due(Instant::now()).is_empty(),
+                "a widget whose own layout was purged must stop being tracked immediately");
+        assert_eq!(cache.next_data_widget_due_in(Instant::now()), None);
+    }
+
+    #[test]
+    fn stale_layout_keys_finds_only_layouts_missing_from_the_required_set() {
+        // Real report: a layout can be replaced/removed on the CMS
+        // without an explicit purge directive for the old version ever
+        // being sent -- RequiredFiles always lists every currently-
+        // needed layout regardless of whether it needs downloading, so
+        // its own absence from that list is just as authoritative.
+        let (mut cache, _dir) = make_cache();
+        for id in [940, 941, 942] {
+            cache.content.insert(format!("{id}.xlf"), Resource::Layout(Arc::new(LayoutInfo {
+                id, md5: vec![], size: (1080, 1920), code: None,
+                enable_stat: true, translated_version: TRANSLATOR_VERSION, sync_keys: vec![],
+            })));
+        }
+        // One widget resource belonging to the stale layout (940) --
+        // must be found too, not just the bare layout file. One
+        // belonging to the still-required layout (941) -- must NOT be
+        // found.
+        cache.content.insert("8001.html".to_string(), Resource::Resource(Arc::new(ResourceInfo {
+            id: 8001, layoutid: 940, regionid: 1, mediaid: 0, updated: 0, duration: None,
+            numitems: None,
+        })));
+        cache.content.insert("8002.html".to_string(), Resource::Resource(Arc::new(ResourceInfo {
+            id: 8002, layoutid: 941, regionid: 1, mediaid: 0, updated: 0, duration: None,
+            numitems: None,
+        })));
+
+        // Only 941 is still in the latest RequiredFiles response --
+        // 940 and 942 are stale.
+        let required: std::collections::HashSet<i64> = [941].into_iter().collect();
+        let mut stale = cache.stale_layout_keys(&required);
+        stale.sort();
+
+        assert_eq!(stale, vec!["8001.html".to_string(), "940.xlf".to_string(),
+                               "942.xlf".to_string()],
+                   "must include the stale layouts' own files AND their widget resources, \
+                    but not a resource belonging to the still-required layout 941");
+    }
+
+    #[test]
     fn purge_stops_tracking_every_widget() {
         let (mut cache, _dir) = make_cache();
         cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940);
@@ -1904,6 +2035,43 @@ mod data_widget_polling_tests {
         // interval (5 minutes), not the short retry backoff.
         let just_under_5_min = succeeded_at + Duration::from_secs(5 * 60 - 1);
         assert!(cache.data_widgets_due(just_under_5_min).is_empty());
+    }
+
+    fn make_cms_with_getdata_fault(faultstring: &'static str) -> xmds::Cms {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><Fault><faultcode>soap:Server</faultcode>
+<faultstring>{faultstring}</faultstring></Fault></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        test_cms_at(port)
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_usual_backoff_regardless_of_fault_text() {
+        // No fault text (not even the CMS's own "Requested an invalid
+        // file") is trusted to mean the widget is genuinely gone -- see
+        // refresh_data_widget's own doc comment for why. Every failure
+        // just backs off, same as "Cache not ready" here.
+        let (mut cache, _dir) = make_cache();
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940);
+        let mut cms = make_cms_with_getdata_fault("Cache not ready.");
+
+        let now = Instant::now();
+        assert!(cache.refresh_data_widget(4543, &mut cms, now).is_err());
+
+        assert!(cache.data_widgets.contains_key(&4543),
+                "must still be tracked -- this fault says nothing about the widget's own \
+                 continued existence");
+        assert!(cache.data_widgets_due(now).is_empty(), "must back off, not retry immediately");
+        let just_over_backoff = now + mainloop::RESOURCE_RETRY_DELAY + Duration::from_millis(1);
+        assert_eq!(cache.data_widgets_due(just_over_backoff), vec![4543]);
     }
 
     // The following tests cover pruning by active schedule -- found
