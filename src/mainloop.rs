@@ -188,6 +188,27 @@ pub struct Handler {
     /// collect_once(), before the per-file results are consumed by
     /// submit_media_inventory.
     last_collect_had_failures: bool,
+    /// The layout `ReqFile` (if any) most recently deferred by
+    /// `is_exempt_as_currently_playing_layout` -- a modified version
+    /// exists on the CMS, but this exact layout is the one currently
+    /// showing, so redownloading it immediately would risk replacing
+    /// its own files out from under itself mid-play. Reset at the
+    /// start of every `download_required_files()` call, set again if
+    /// still exempt that cycle.
+    ///
+    /// Confirmed real: with `expire_modified_layouts` off, waiting for
+    /// the *next* collection cycle to pick this up once the layout
+    /// stops being current doesn't work at all for a layout that keeps
+    /// looping itself (the CMS's own default fallback, or any single-
+    /// layout schedule) -- it never stops being "current" in between,
+    /// yet it reloads its own page via `ForceReloadLayout` every single
+    /// time it completes a natural cycle regardless. Checked and
+    /// consumed right there, in `FromGui::LayoutCompleted`'s own
+    /// handler, *before* that reload is sent -- the reload was already
+    /// about to happen either way, so this doesn't add a disruption,
+    /// just makes sure it shows fresh content instead of the same
+    /// stale page again.
+    deferred_layout_file: Option<ReqFile>,
     /// Set by an XMR `changeLayout` action: while `Some`, completely
     /// bypasses the normal CMS-driven schedule (see `schedule_check()`)
     /// and forces this one layout to be shown, exactly like the C#
@@ -660,6 +681,7 @@ impl Handler {
             let mut slf = Self { to_gui, from_gui, settings, cache, xmds, xmr, schedule,
                                  layouts, commands_run: std::collections::HashSet::new(),
                                  envdir: envdir.into(), current_layout: 0, force_reload_after_collect: false, last_collect_had_failures: false,
+                                 deferred_layout_file: None,
                                  override_layout: None, overlay_layout: None,
                                  stats: StatCollector::default(),
                                  faults: faults::FaultCollector::default(),
@@ -710,6 +732,7 @@ impl Handler {
                                  cache, xmds, xmr: never(), schedule: Schedule::default(),
                                  layouts: vec![], commands_run: std::collections::HashSet::new(),
                                  envdir: envdir.into(), current_layout: 0, force_reload_after_collect: false, last_collect_had_failures: false,
+                                 deferred_layout_file: None,
                                  override_layout: None, overlay_layout: None,
                                  stats: StatCollector::default(),
                                  faults: faults::FaultCollector::default(),
@@ -1297,6 +1320,51 @@ impl Handler {
                                 .filter(|&id| self.cache.get_layout(id).is_some())
                                 .collect();
                             if available == self.layouts && available.len() == 1 {
+                                // A reload is about to happen either way
+                                // (see the reason computation right
+                                // below) -- if this exact layout was the
+                                // one deferred earlier this collection
+                                // cycle (see deferred_layout_file's own
+                                // doc comment), fetch its now-current
+                                // version right now instead of showing
+                                // the same stale page again. No added
+                                // disruption: the reload was coming
+                                // regardless.
+                                let is_deferred_match = matches!(&self.deferred_layout_file,
+                                    Some(ReqFile::File { typ: "layout", id, .. })
+                                        if *id == available[0]);
+                                if is_deferred_match {
+                                    let file = self.deferred_layout_file.take().unwrap();
+                                    match self.new_worker_cms() {
+                                        Ok(mut cms) => {
+                                            let dir = self.cache.dir().clone();
+                                            let agent = self.cache.agent().clone();
+                                            let code_map = self.cache.code_map().clone();
+                                            let adspace_cfg = self.cache.adspace_enabled.then(||
+                                                crate::adspace::AdspaceConfig {
+                                                    agent: agent.clone(),
+                                                    cache_dir: dir.join("adspace"),
+                                                    partner: self.cache.adspace_partner.clone(),
+                                                });
+                                            match Cache::fetch_content(file, &dir, &agent, &code_map,
+                                                    adspace_cfg, self.cache.html_port, &mut cms)
+                                                .and_then(|content| self.cache.commit(content)) {
+                                                Ok(()) => log::info!("layout {} fetched fresh \
+                                                    right before reloading it (was deferred \
+                                                    while it was the one currently playing)",
+                                                    available[0]),
+                                                Err(e) => log::warn!("fetching layout {} fresh \
+                                                    before reloading it: {e:#} -- reloading \
+                                                    with whatever's on disk instead",
+                                                    available[0]),
+                                            }
+                                        }
+                                        Err(e) => log::warn!("constructing a Cms to fetch \
+                                            layout {} fresh before reloading it: {e:#} -- \
+                                            reloading with whatever's on disk instead",
+                                            available[0]),
+                                    }
+                                }
                                 let reason = if was_cycle_member {
                                     ForceReloadReason::CycleGroupOfOne
                                 } else if in_sync_group {
@@ -1629,7 +1697,20 @@ impl Handler {
         let (required, mut purge) = self.xmds.required_files()?;
 
         // update layout code map
-        self.cache.update_code_map(&required)?;
+        if self.cache.update_code_map(&required)? {
+            log::info!("a layout code now resolves to a different id -- retranslating every \
+                        cached layout so any Navigate Layout action referencing it by code \
+                        picks up the new target");
+            let dir = self.cache.dir().clone();
+            let agent = self.cache.agent().clone();
+            let adspace_cfg = self.cache.adspace_enabled.then(|| crate::adspace::AdspaceConfig {
+                agent, cache_dir: dir.join("adspace"),
+                partner: self.cache.adspace_partner.clone(),
+            });
+            if let Err(e) = self.cache.retranslate_all_layouts(adspace_cfg, self.cache.html_port) {
+                log::warn!("retranslating cached layouts after a code_map change: {e:#}");
+            }
+        }
 
         // RequiredFiles always lists every currently-needed layout
         // (already-cached ones too, just skipped from actually
@@ -1792,6 +1873,7 @@ impl Handler {
         // checks are cheap, local, and don't benefit from
         // parallelizing at all).
         let mut pending: Vec<ReqFile> = Vec::new();
+        self.deferred_layout_file = None;
         for file in required {
             if self.cache.has(&file) {
                 // A file already fully cached from an earlier cycle
@@ -1820,6 +1902,7 @@ impl Handler {
                 // cycle, same as before this fix: it's genuinely not
                 // yet the version the CMS is asking for, unlike the
                 // already-fully-cached case just above.
+                self.deferred_layout_file = Some(file.clone());
                 continue;
             }
             pending.push(file);
@@ -4828,6 +4911,103 @@ mod handle_trigger_code_tests {
         let msg = togui_rx.try_recv().expect("a genuinely scheduled single layout must reload");
         assert!(matches!(msg, ToGui::ForceReloadLayout(913, ForceReloadReason::SingleLayoutLoop)),
                 "must be force-reloaded with the SingleLayoutLoop reason");
+    }
+
+    #[test]
+    fn layout_completed_consumes_a_deferred_layout_fetch_before_reloading() {
+        // Real report: with expire_modified_layouts off, a layout that
+        // keeps looping itself (the CMS's own default, or any single-
+        // layout schedule) never stops being "current" in between its
+        // own completions -- the next collection cycle alone never
+        // gets a chance to pick up a version deferred by
+        // is_exempt_as_currently_playing_layout. The reload about to
+        // happen here (confirmed by the test above) is the right,
+        // non-disruptive moment to fetch it instead.
+        //
+        // Points at an unreachable address so the fetch attempt itself
+        // is the only thing under test here (fetch_content's own
+        // correctness has its own dedicated tests) -- it must still be
+        // consumed and attempted, and the reload must still proceed
+        // regardless of the outcome.
+        let unreachable_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let cms = CmsSettings {
+            address: format!("http://127.0.0.1:{unreachable_port}"),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        };
+        let envdir = test_envdir();
+        let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
+                                        std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading)))
+            .expect("must construct successfully even against an unreachable CMS");
+
+        let xml = r#"<schedule generated="2026-01-01 00:00:00" filterFrom="2026-01-01 00:00:00" filterTo="2026-01-02 00:00:00">
+  <layout file="913" fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07" scheduleid="1" priority="0" syncEvent="0" shareOfVoice="0" duration="60" isGeoAware="0" geoLocation="" cyclePlayback="0" groupKey="0" playCount="0" maxPlaysPerHour="0"/>
+  <default file="913" duration="60"/>
+</schedule>"#;
+        let tree = elementtree::Element::from_reader(xml.as_bytes()).unwrap();
+        handler.schedule = Schedule::parse(&tree).unwrap();
+        handler.cache.insert_fake_layout_for_test(913);
+        handler.layouts = vec![913];
+        handler.current_layout = 913;
+        handler.deferred_layout_file = Some(ReqFile::File {
+            id: 913, typ: "layout", size: 0, md5: vec![], http: false,
+            path: String::new(), name: "913.xlf".into(), code: None,
+        });
+        while togui_rx.try_recv().is_ok() {} // drain any startup messages
+
+        // Same simulated FromGui::LayoutCompleted logic the real
+        // select! loop runs, including the deferred-fetch check (see
+        // the other tests in this module).
+        if handler.override_revert_on_completion && handler.override_layout.take().is_some() {
+            handler.override_revert_on_completion = false;
+            handler.schedule_check();
+        } else if handler.override_layout.is_none() {
+            let was_cycle_member = handler.schedule.record_cycle_group_completion(
+                handler.current_layout, &handler.criteria, &mut handler.cycle_state);
+            let in_sync_group = handler.sync_layout_active;
+            let resolved = handler.schedule.layouts_now(&handler.criteria, &mut handler.cycle_state);
+            let available: Vec<_> = resolved.iter().copied()
+                .filter(|&id| handler.cache.get_layout(id).is_some())
+                .collect();
+            if available == handler.layouts && available.len() == 1 {
+                let is_deferred_match = matches!(&handler.deferred_layout_file,
+                    Some(ReqFile::File { typ: "layout", id, .. }) if *id == available[0]);
+                if is_deferred_match {
+                    let file = handler.deferred_layout_file.take().unwrap();
+                    if let Ok(mut cms) = handler.new_worker_cms() {
+                        let dir = handler.cache.dir().clone();
+                        let agent = handler.cache.agent().clone();
+                        let code_map = handler.cache.code_map().clone();
+                        let _ = Cache::fetch_content(file, &dir, &agent, &code_map,
+                                                      None, handler.cache.html_port, &mut cms);
+                    }
+                }
+                let reason = if was_cycle_member { ForceReloadReason::CycleGroupOfOne }
+                             else if in_sync_group { ForceReloadReason::SyncGroup }
+                             else { ForceReloadReason::SingleLayoutLoop };
+                handler.to_gui.send(ToGui::ForceReloadLayout(available[0], reason)).unwrap();
+            }
+        }
+
+        assert!(handler.deferred_layout_file.is_none(),
+                "must be consumed (taken) once a reload for the matching layout happens, \
+                 regardless of whether the fetch attempt itself succeeded");
+        let msg = togui_rx.try_recv().expect("the reload must still proceed regardless of \
+                                               whether the deferred fetch succeeded");
+        assert!(matches!(msg, ToGui::ForceReloadLayout(913, _)),
+                "must still be force-reloaded even though the fetch attempt failed (CMS \
+                 unreachable) -- better to show what's on disk than nothing at all");
     }
 
     #[test]

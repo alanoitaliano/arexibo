@@ -318,6 +318,53 @@ impl Cache {
         &self.code_map
     }
 
+    /// Re-runs the translator against every cached layout's own,
+    /// already-downloaded XLF (no network access at all -- CPU-bound
+    /// only), using `self.code_map` as it currently stands. Meant to be
+    /// called right after `update_code_map` reports a genuine mapping
+    /// change (see its own doc comment for the full "a Navigate Layout
+    /// action's target code now resolves to a different id" scenario
+    /// this fixes) -- every *other* cached layout's own translated
+    /// output can depend on this mapping without its own raw XML ever
+    /// changing, so it would otherwise never get regenerated. One
+    /// failure (a layout whose own XLF went missing, say) is logged and
+    /// skipped rather than aborting the rest.
+    pub fn retranslate_all_layouts(&mut self, adspace_cfg: Option<crate::adspace::AdspaceConfig>,
+                                    html_port: u16) -> Result<()> {
+        let layout_ids: Vec<LayoutId> = self.content.values()
+            .filter_map(|r| match r {
+                Resource::Layout(info) => Some(info.id),
+                _ => None
+            })
+            .collect();
+        for id in layout_ids {
+            let name = format!("{id}.xlf");
+            let xlf_path = self.dir.join(&name);
+            let html_path = self.dir.join(format!("{name}.html"));
+            let result = layout::Translator::new(id, &xlf_path, &html_path, &self.code_map,
+                                                  adspace_cfg.clone(), html_port)
+                .and_then(|xl| xl.translate());
+            match result {
+                Ok((w, h, enable_stat, sync_keys)) => {
+                    if let Some(Resource::Layout(info)) = self.content.get(&name) {
+                        let updated = LayoutInfo { id, md5: info.md5.clone(), size: (w, h),
+                                                    code: info.code.clone(), enable_stat,
+                                                    translated_version: TRANSLATOR_VERSION,
+                                                    sync_keys };
+                        self.content.insert(name, Resource::Layout(Arc::new(updated)));
+                    }
+                }
+                Err(e) => log::warn!("retranslating layout {id} after a code_map change: \
+                                       {e:#} -- its own Navigate Layout actions (if any \
+                                       reference a code that just changed id) may still \
+                                       point at a stale target until it's next genuinely \
+                                       redownloaded"),
+            }
+        }
+        self.save()?;
+        Ok(())
+    }
+
     pub fn has(&self, res: &ReqFile) -> bool {
         match *res {
             ReqFile::Resource { id, updated, .. } => {
@@ -516,13 +563,44 @@ impl Cache {
         Ok(())
     }
 
-    pub fn update_code_map(&mut self, files: &[ReqFile]) -> Result<()> {
+    /// Returns whether any *existing* code->id mapping actually changed
+    /// (not just a new code being inserted for the first time) --
+    /// confirmed real: a layout's own `layoutCode` (used by a Navigate
+    /// Layout action's own `layoutCode` attribute specifically so the
+    /// action keeps working across a republish, which changes the
+    /// numeric id but not the code) staying the same while its own id
+    /// changes means every *other* cached layout with an action
+    /// referencing that code now needs retranslating to resolve it to
+    /// the new id -- even though none of their own raw XML changed at
+    /// all, so they'd otherwise never be redownloaded/retranslated
+    /// again (see mainloop.rs's own caller for the retranslation
+    /// itself; this only detects that it's needed).
+    ///
+    /// Resolves this cycle's own `files` down to one final id per code
+    /// first (last one in the list wins -- matches a plain sequential
+    /// insert's own end result), *then* compares each against the prior
+    /// cycle's value. Confirmed real: this same CMS test instance has
+    /// several old, unrelated layouts sharing one identical code (e.g.
+    /// three different ids all under "HOME_layout_NEW") -- comparing
+    /// one `ReqFile` at a time instead, in whatever order required.xml
+    /// happens to list them, falsely reports a change on every single
+    /// cycle from their own mutual bouncing alone, even with nothing
+    /// genuinely different from the cycle before.
+    pub fn update_code_map(&mut self, files: &[ReqFile]) -> Result<bool> {
+        let mut this_cycle: HashMap<String, LayoutId> = HashMap::new();
         for file in files {
             if let ReqFile::File { typ: "layout", id, code: Some(code), .. } = file {
-                self.code_map.insert(code.clone(), *id);
+                this_cycle.insert(code.clone(), *id);
             }
         }
-        Ok(())
+        let mut changed = false;
+        for (code, id) in this_cycle {
+            if self.code_map.get(&code).is_some_and(|existing| *existing != id) {
+                changed = true;
+            }
+            self.code_map.insert(code, id);
+        }
+        Ok(changed)
     }
 
     /// Resolves a Layout's own `code` (an admin-assigned alphanumeric
@@ -829,6 +907,27 @@ impl Cache {
                 if dropped > 0 {
                     log::info!("{name} purged -- also stopped tracking {dropped} of its own \
                                 data widget(s)");
+                }
+                // Real report: purging a layout's own raw "N.xlf" left
+                // its separate, already-translated "N.xlf.html" --
+                // what the embedded server actually serves -- sitting
+                // on disk untouched. Neither the CMS's own purge list
+                // nor stale_layout_keys ever mentions this derived
+                // file (the CMS has no notion of it, and it isn't
+                // tracked as its own Resource in self.content at all),
+                // so it was never cleaned up: a stale shell kept being
+                // served, still referencing widget resources that *did*
+                // get purged correctly alongside it -- every one of its
+                // own iframes 404ing, a blank layout, the moment
+                // something navigated to it.
+                if matches!(&removed, Resource::Layout(_)) {
+                    let html_name = format!("{name}.html");
+                    match fs::remove_file(self.dir.join(&html_name)) {
+                        Ok(()) => log::info!("purged {html_name} (translated output of \
+                                              {name}, now purged itself)"),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => log::warn!("could not purge {html_name}: {e:#}"),
+                    }
                 }
             }
         }
@@ -1791,6 +1890,32 @@ mod data_widget_polling_tests {
     }
 
     #[test]
+    fn purging_a_layout_also_removes_its_own_translated_html_output() {
+        // Real report: a blank page on navigating to a layout whose
+        // target got replaced -- "940.xlf" (the raw source, purged
+        // correctly, along with its own widget resources) is a
+        // *different* file from "940.xlf.html" (the already-translated
+        // output the embedded server actually serves). Neither the
+        // CMS's own purge list nor stale_layout_keys ever mentions the
+        // derived file, so it used to linger on disk untouched, still
+        // referencing widget resources that *did* get purged alongside
+        // it -- every one of its own iframes 404ing on navigation.
+        let (mut cache, dir) = make_cache();
+        cache.content.insert("940.xlf".to_string(), Resource::Layout(Arc::new(LayoutInfo {
+            id: 940, md5: vec![], size: (1080, 1920), code: None,
+            enable_stat: true, translated_version: TRANSLATOR_VERSION, sync_keys: vec![],
+        })));
+        fs::write(dir.join("940.xlf.html"), "<html>stale shell</html>").unwrap();
+        assert!(dir.join("940.xlf.html").exists());
+
+        cache.purge_some(&["940.xlf".to_string()]).unwrap();
+
+        assert!(!dir.join("940.xlf.html").exists(),
+                "the layout's own translated HTML output must be purged alongside its \
+                 raw source, not left behind as a stale shell");
+    }
+
+    #[test]
     fn stale_layout_keys_finds_only_layouts_missing_from_the_required_set() {
         // Real report: a layout can be replaced/removed on the CMS
         // without an explicit purge directive for the old version ever
@@ -2156,5 +2281,144 @@ mod data_widget_polling_tests {
         assert!(cache.is_tracked_data_widget(4543));
         assert!(!cache.is_tracked_data_widget(9999),
                 "must not report an unrelated widget id as tracked");
+    }
+}
+
+#[cfg(test)]
+mod update_code_map_tests {
+    use super::*;
+
+    fn make_cache() -> (Cache, PathBuf) {
+        let dir = std::env::temp_dir()
+            .join(format!("arexibo_code_map_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cms = CmsSettings {
+            address: "https://example.com".into(), key: "k".into(),
+            display_id: "d".into(), display_name: None, proxy: None,
+        };
+        (Cache::new(&cms, dir.clone(), false, true).unwrap(), dir)
+    }
+
+    fn layout_file(id: LayoutId, code: &str) -> ReqFile {
+        ReqFile::File { id, typ: "layout", size: 0, md5: vec![], http: false,
+                         path: String::new(), name: format!("{id}.xlf"),
+                         code: Some(code.to_string()) }
+    }
+
+    #[test]
+    fn a_brand_new_code_is_not_reported_as_a_change() {
+        let (mut cache, _dir) = make_cache();
+        let changed = cache.update_code_map(&[layout_file(1438, "documenti_geco")]).unwrap();
+        assert!(!changed, "a code seen for the first time isn't a *change* to anything");
+        assert_eq!(cache.code_map().get("documenti_geco"), Some(&1438));
+    }
+
+    #[test]
+    fn the_same_code_resolving_to_a_new_id_is_reported_as_a_change() {
+        // Real report: a Navigate Layout action references its target
+        // by this stable code specifically so republishing the target
+        // (which changes its numeric id) doesn't break the action --
+        // but every *other* cached layout referencing it by code now
+        // needs retranslating to pick up the new id.
+        let (mut cache, _dir) = make_cache();
+        cache.update_code_map(&[layout_file(1438, "documenti_geco")]).unwrap();
+
+        let changed = cache.update_code_map(&[layout_file(1439, "documenti_geco")]).unwrap();
+
+        assert!(changed, "the same code now resolving to a different id must be reported");
+        assert_eq!(cache.code_map().get("documenti_geco"), Some(&1439),
+                   "the map itself must still end up with the new id either way");
+    }
+
+    #[test]
+    fn the_same_code_resolving_to_the_same_id_again_is_not_a_change() {
+        let (mut cache, _dir) = make_cache();
+        cache.update_code_map(&[layout_file(1439, "documenti_geco")]).unwrap();
+
+        let changed = cache.update_code_map(&[layout_file(1439, "documenti_geco")]).unwrap();
+
+        assert!(!changed, "re-confirming the exact same mapping isn't a change");
+    }
+
+    #[test]
+    fn an_unrelated_codes_own_first_appearance_does_not_mask_a_real_change_elsewhere() {
+        let (mut cache, _dir) = make_cache();
+        cache.update_code_map(&[layout_file(1438, "documenti_geco")]).unwrap();
+
+        // Both in the same required_files() response: one brand new
+        // code, one existing code that changed id.
+        let changed = cache.update_code_map(&[
+            layout_file(1432, "numeri_utili_geco"),
+            layout_file(1439, "documenti_geco"),
+        ]).unwrap();
+
+        assert!(changed, "must still report true overall when at least one entry changed");
+    }
+
+    #[test]
+    fn duplicate_codes_within_one_response_do_not_falsely_report_a_change() {
+        // Real report: a CMS test instance with several old, unrelated
+        // layouts all sharing one identical code (three different ids
+        // under "HOME_layout_NEW") made this fire on *every* cycle --
+        // even a completely fresh --clear startup, nothing genuinely
+        // different from one cycle to the next, purely from their own
+        // mutual bouncing within the very same required.xml response.
+        let (mut cache, _dir) = make_cache();
+
+        let changed = cache.update_code_map(&[
+            layout_file(913, "HOME_layout_NEW"),
+            layout_file(550, "HOME_layout_NEW"),
+            layout_file(1043, "HOME_layout_NEW"),
+        ]).unwrap();
+        assert!(!changed, "a brand new (if messily duplicated) code is not a *change*");
+
+        // Same three, same order, next cycle -- nothing genuinely
+        // different this time either.
+        let changed_again = cache.update_code_map(&[
+            layout_file(913, "HOME_layout_NEW"),
+            layout_file(550, "HOME_layout_NEW"),
+            layout_file(1043, "HOME_layout_NEW"),
+        ]).unwrap();
+        assert!(!changed_again, "must not report a change when nothing genuinely differs \
+                                  from the cycle before, regardless of how many duplicate \
+                                  ids share this code within the same response");
+    }
+
+    #[test]
+    fn retranslate_all_layouts_regenerates_the_html_output_on_disk() {
+        // Confirms the mechanical part end-to-end: an already-cached
+        // layout's own XLF (already on disk, untouched -- no network
+        // access at all here) gets re-run through the translator and
+        // its own stored metadata updated, without needing a fresh
+        // download. Doesn't exercise a real Navigate Layout action
+        // resolving to a different id specifically (covered by
+        // update_code_map's own tests above, plus the translator's own
+        // existing layoutCode-resolution tests elsewhere) -- just that
+        // this mechanism itself runs correctly against a real file.
+        let (mut cache, dir) = make_cache();
+        let xlf = r#"<layout width="1080" height="1920">
+            <region id="1" left="0" top="0" width="500" height="500">
+                <media id="9001" type="image" duration="10"><options><uri>a.png</uri></options></media>
+            </region>
+        </layout>"#;
+        fs::write(dir.join("940.xlf"), xlf).unwrap();
+        cache.content.insert("940.xlf".to_string(), Resource::Layout(Arc::new(LayoutInfo {
+            id: 940, md5: vec![1, 2, 3], size: (0, 0), code: Some("home".into()),
+            enable_stat: true, translated_version: 0, sync_keys: vec![],
+        })));
+
+        cache.retranslate_all_layouts(None, 9696).unwrap();
+
+        assert!(dir.join("940.xlf.html").exists(),
+                "must regenerate the translated HTML output on disk");
+        let Some(Resource::Layout(info)) = cache.content.get("940.xlf") else {
+            panic!("layout entry must still be present after retranslation");
+        };
+        assert_eq!(info.translated_version, TRANSLATOR_VERSION,
+                   "must record a fresh translation, not leave the old version number");
+        assert_eq!(info.md5, vec![1, 2, 3], "md5/code must be preserved -- the raw XLF itself \
+                                              didn't change, only its own translated output");
+        assert_eq!(info.code, Some("home".into()));
     }
 }
