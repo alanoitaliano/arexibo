@@ -183,6 +183,9 @@ window.arexibo = {
   // those aren't part of region.media at all, so the lookup below
   // checks both. 'expire' calls region.drawerRevert() in that case
   // (region_switch would silently no-op on this region's single item).
+  // 'reset' restarts the current countdown with the same total duration;
+  // the Qt side sends it when a native webpage is touched (see
+  // Window::eventFilter in gui/view.cpp). Returns whether it acted.
   controlDuration: function(widgetId, action, durationSecs) {
     for (const ridStr in this.regions) {
       const rid = Number(ridStr);
@@ -198,11 +201,15 @@ window.arexibo = {
         } else {
           this.region_switch(rid, -1, false);
         }
-      } else if (action === 'set' || action === 'extend') {
+      } else if (action === 'set' || action === 'extend' || action === 'reset') {
+        // Without a valid duration setTimeout(NaN) would expire the widget at once.
+        if (action === 'reset' && !(region.timeoutDuration > 0)) return false;
         window.clearTimeout(region.timeoutid);
         let newDurationMs;
         if (action === 'set') {
           newDurationMs = durationSecs * 1000;
+        } else if (action === 'reset') {
+          newDurationMs = region.timeoutDuration;
         } else {
           const elapsed = Date.now() - region.timeoutStart;
           const remaining = Math.max(0, region.timeoutDuration - elapsed);
@@ -214,10 +221,27 @@ window.arexibo = {
           isDrawerSwap ? region.drawerRevert : () => { this.region_switch(rid, -1, false); },
           newDurationMs);
       }
-      return;
+      return true;
     }
     console.warn('controlDuration: widget ' + widgetId +
                  ' not found or not currently active in its region');
+    return false;
+  },
+
+  // Entry point for gui/view.cpp when a native webpage is touched: restarts
+  // the widget's countdown and returns a status string for its log line.
+  touchReset: function(widgetId) {
+    for (const rid in this.regions) {
+      const region = this.regions[rid];
+      const idx = (region.media || []).findIndex(m => m[3] === widgetId);
+      const isDrawerSwap = region.drawerWidgetId === widgetId;
+      if (idx === -1 && !isDrawerSwap) continue;
+      if (!isDrawerSwap && region.cur !== idx)
+        return 'not active (region shows item ' + region.cur + ', widget is item ' + idx + ')';
+      return this.controlDuration(widgetId, 'reset', 0) ? 'applied'
+        : 'no valid timer (timeoutDuration=' + region.timeoutDuration + ')';
+    }
+    return 'widget not found in any region';
   },
 
   region_done: function(rid) {
@@ -515,6 +539,23 @@ struct Transitions {
     out_ms: u32,
 }
 
+/// Display identity, substituted into a native Webpage widget's URL.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisplayInfo {
+    pub name: String,
+    pub hardware_key: String,
+}
+
+/// Replaces `[DisplayName]` / `[HardwareKey]` with their url-encoded
+/// values. `None` leaves the URL untouched.
+fn substitute_display_placeholders(url: &str, display: Option<&DisplayInfo>) -> String {
+    match display {
+        Some(d) => url.replace("[DisplayName]", &percent_encode(&d.name))
+                      .replace("[HardwareKey]", &percent_encode(&d.hardware_key)),
+        None => url.to_string(),
+    }
+}
+
 pub struct Translator<'a> {
     id: LayoutId,
     tree: Option<Element>,
@@ -583,6 +624,8 @@ pub struct Translator<'a> {
     /// `render="html"` widget's own absolute, sharded iframe `src` in
     /// `write_media`.
     html_port: u16,
+    /// `None`: placeholders in a native webpage URL are left as-is.
+    display: Option<DisplayInfo>,
     /// Every distinct, non-empty `syncKey` found on any real region (or
     /// the drawer, which carries the same attribute) while translating
     /// -- `<region ... syncKey="sync1">` on a region containing a
@@ -610,8 +653,14 @@ impl<'a> Translator<'a> {
                   widget_regions: HashMap::new(), drawer_widgets: std::collections::HashSet::new(),
                   swap_target_regions: std::collections::HashSet::new(),
                   region_geom: HashMap::new(),
-                  enable_stat: true, adspace, html_port,
+                  enable_stat: true, adspace, html_port, display: None,
                   sync_keys: std::collections::HashSet::new() })
+    }
+
+    /// Provides the display identity used to fill native webpage URL placeholders.
+    pub fn with_display(mut self, display: DisplayInfo) -> Self {
+        self.display = Some(display);
+        self
     }
 
     pub fn translate(mut self) -> Result<(i32, i32, bool, Vec<String>)> {
@@ -1391,6 +1440,7 @@ impl<'a> Translator<'a> {
                 let truly_native = media.get_attr("render") == Some("native")
                     && mode_id.as_deref() == Some("1");
                 if truly_native {
+                    let url = substitute_display_placeholders(&url, self.display.as_ref());
                     // A real top-level browser view, not embedded via
                     // iframe -- not subject to X-Frame-Options (which
                     // only blocks embedding). Empty placeholder for the
@@ -2064,6 +2114,113 @@ mod native_webpage_tests {
             .join(format!("arexibo_native_webpage_test_{}_{n}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         dir
+    }
+
+    fn translate_xlf_with_display(xlf: &str, display: Option<DisplayInfo>) -> String {
+        let dir = tempdir();
+        let xlf_path = dir.join("test.xlf");
+        let html_path = dir.join("test.html");
+        fs::write(&xlf_path, xlf).unwrap();
+        let map = HashMap::new();
+        let mut t = Translator::new(1, &xlf_path, &html_path, &map, None, 0).unwrap();
+        if let Some(d) = display {
+            t = t.with_display(d);
+        }
+        t.translate().unwrap();
+        let mut html = String::new();
+        fs::File::open(html_path).unwrap().read_to_string(&mut html).unwrap();
+        html
+    }
+
+    fn native_webpage_xlf(uri: &str, modeid: &str) -> String {
+        format!(r#"<layout width="1920" height="1080">
+            <region id="7" left="150" top="250" width="400" height="300">
+                <media id="9001" type="webpage" render="native" duration="10">
+                    <options><uri>{uri}</uri><modeid>{modeid}</modeid></options>
+                </media>
+            </region>
+        </layout>"#)
+    }
+
+    fn totem() -> DisplayInfo {
+        DisplayInfo { name: "totem-014".into(), hardware_key: "abc123".into() }
+    }
+
+    #[test]
+    fn native_webpage_placeholders_are_substituted_in_both_places_the_url_appears() {
+        let xlf = native_webpage_xlf(
+            "https://x.test/?n=[DisplayName]&amp;k=[HardwareKey]", "1");
+        let html = translate_xlf_with_display(&xlf, Some(totem()));
+        let want = "https://x.test/?n=totem-014&k=abc123";
+        assert!(html.contains(&format!(r#"jsNativeWebShow(9001, "{want}", 150, 250, 400, 300);"#)),
+                "the show call must carry the substituted URL -- got:\n{html}");
+        assert!(html.contains(&format!("data-native-webpage-url='{want}'")),
+                "the data attribute (re-used after a drawer swap) must carry it too");
+        assert!(!html.contains("[DisplayName]") && !html.contains("[HardwareKey]"),
+                "no raw placeholder may survive");
+    }
+
+    #[test]
+    fn native_webpage_placeholders_stored_percent_encoded_by_the_cms_are_still_substituted() {
+        // Decoding happens first, so %5B/%5D brackets still match.
+        let xlf = native_webpage_xlf(
+            "https%3A%2F%2Fx.test%2F%3Fn%3D%5BDisplayName%5D%26k%3D%5BHardwareKey%5D", "1");
+        let html = translate_xlf_with_display(&xlf, Some(totem()));
+        assert!(html.contains(r#""https://x.test/?n=totem-014&k=abc123""#), "got:\n{html}");
+    }
+
+    #[test]
+    fn native_webpage_placeholder_values_are_url_encoded() {
+        let xlf = native_webpage_xlf("https://x.test/?n=[DisplayName]&amp;k=[HardwareKey]", "1");
+        let d = DisplayInfo { name: "Lobby & Caf\u{e9} 'A'".into(), hardware_key: "a b".into() };
+        let html = translate_xlf_with_display(&xlf, Some(d));
+        assert!(html.contains("n=Lobby%20%26%20Caf%C3%A9%20%27A%27&k=a%20b"),
+                "name/key must be percent-encoded -- got:\n{html}");
+        // The URL sits in a single-quoted attribute: a raw quote would break it.
+        assert!(!html.contains("Lobby & Caf"), "no raw, unencoded value may be written");
+    }
+
+    #[test]
+    fn native_webpage_placeholders_are_left_alone_without_display_info() {
+        let xlf = native_webpage_xlf("https://x.test/?n=[DisplayName]", "1");
+        let html = translate_xlf_with_display(&xlf, None);
+        assert!(html.contains(r#""https://x.test/?n=[DisplayName]""#),
+                "without display info the URL must be untouched -- got:\n{html}");
+    }
+
+    #[test]
+    fn manual_position_mode_is_not_touched_by_placeholder_substitution() {
+        // Modes 2/3 load a CMS-generated resource HTML in an iframe: the URL
+        // never passes through here at all.
+        let xlf = native_webpage_xlf("https://x.test/?n=[DisplayName]", "2");
+        let html = translate_xlf_with_display(&xlf, Some(totem()));
+        assert!(!html.contains("totem-014") && !html.contains("jsNativeWebShow(9001"),
+                "mode 2 must stay on the resource-iframe path -- got:\n{html}");
+    }
+
+    #[test]
+    fn generated_script_supports_the_reset_duration_action_with_its_guard() {
+        // Sent by gui/view.cpp when a native webpage is touched. The guard
+        // matters: without a valid duration, setTimeout(NaN) would expire
+        // the widget immediately. (Behaviour itself was checked with a node
+        // harness; this only keeps the action from being dropped.)
+        let html = translate_xlf(&native_webpage_xlf("https://x.test/", "1"));
+        assert!(html.contains("action === 'reset'"), "script must handle 'reset'");
+        assert!(html.contains("if (action === 'reset' && !(region.timeoutDuration > 0)) return false;"),
+                "'reset' must bail out before touching the timer when there is no valid duration");
+        assert!(html.contains("newDurationMs = region.timeoutDuration;"),
+                "'reset' must restart the countdown with the same total duration");
+        assert!(html.contains("touchReset: function(widgetId)"),
+                "gui/view.cpp calls touchReset; a page without it is reported as stale");
+    }
+
+    #[test]
+    fn substitute_display_placeholders_handles_repeats_and_is_case_sensitive() {
+        let d = totem();
+        assert_eq!(substitute_display_placeholders("[DisplayName]/[DisplayName]", Some(&d)),
+                   "totem-014/totem-014");
+        assert_eq!(substitute_display_placeholders("[displayname]", Some(&d)), "[displayname]");
+        assert_eq!(substitute_display_placeholders("https://x.test/", Some(&d)), "https://x.test/");
     }
 
     #[test]

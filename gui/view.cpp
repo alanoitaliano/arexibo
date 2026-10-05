@@ -582,8 +582,30 @@ bool Window::eventFilter(QObject *watched, QEvent *event)
         std::cout << "DEBUG: [arexibo::qt] press/touch actually delivered to: " << which \
                   << std::endl;
 
-        for (auto nview : native_views) {
-            if (watched == nview->focusProxy()) { nview->setFocus(); break; }
+        for (auto it = native_views.constBegin(); it != native_views.constEnd(); ++it) {
+            if (watched == it.value()->focusProxy()) {
+                it.value()->setFocus();
+                // A touched native webpage restarts its own duration countdown.
+                if (view) {
+                    // Not runJavascriptImpl: its --web-debug gate reads a per-file copy
+                    // of g_web_debug_enabled that is never set. The result line below is
+                    // always printed, so the reset can be checked on a real device.
+                    const int mid = it.key();
+                    view->page()->runJavaScript(
+                        QString("window.arexibo ? (window.arexibo.touchReset ? "
+                                "window.arexibo.touchReset(%1) : "
+                                "'page predates touchReset (cached layout needs retranslating)') "
+                                ": 'no window.arexibo'").arg(mid),
+                        [mid](const QVariant &status) {
+                            std::cout << "DEBUG: [arexibo::qt] native widget " << mid
+                                      << " touched -- duration reset: "
+                                      << (status.isValid() ? status.toString().toStdString()
+                                                           : std::string("no result (JS error?)"))
+                                      << std::endl;
+                        });
+                }
+                break;
+            }
         }
         for (auto nview : overlay_native_views) {
             if (watched == nview->focusProxy()) { nview->setFocus(); break; }

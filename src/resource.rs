@@ -194,6 +194,11 @@ pub struct Cache {
     /// `purge`/`purge_some` alongside their containing resource, so
     /// this never accumulates entries for widgets no longer scheduled.
     data_widgets: HashMap<i64, DataWidgetState>,
+    /// CMS-assigned display name (PlayerSettings) -- set by mainloop.rs's
+    /// `update_settings`; used to fill native webpage URL placeholders.
+    pub display_name: String,
+    /// Same value sent as `hardwareKey` to the CMS (`CmsSettings::display_id`).
+    hardware_key: String,
 }
 
 /// Polling state for one data widget (see `data_widgets`'s own doc
@@ -278,7 +283,9 @@ impl Cache {
 
         let cache = Self { dir, agent: cms.make_agent(no_verify)?, content, code_map,
                            adspace_enabled: false, adspace_partner: None, html_port: 0,
-                           data_widgets: HashMap::new() };
+                           data_widgets: HashMap::new(),
+                           display_name: String::new(),
+                           hardware_key: cms.display_id.clone() };
         cache.install_pdfjs()?;
         Ok(cache)
     }
@@ -318,17 +325,16 @@ impl Cache {
         &self.code_map
     }
 
-    /// Re-runs the translator against every cached layout's own,
-    /// already-downloaded XLF (no network access at all -- CPU-bound
-    /// only), using `self.code_map` as it currently stands. Meant to be
-    /// called right after `update_code_map` reports a genuine mapping
-    /// change (see its own doc comment for the full "a Navigate Layout
-    /// action's target code now resolves to a different id" scenario
-    /// this fixes) -- every *other* cached layout's own translated
-    /// output can depend on this mapping without its own raw XML ever
-    /// changing, so it would otherwise never get regenerated. One
-    /// failure (a layout whose own XLF went missing, say) is logged and
-    /// skipped rather than aborting the rest.
+    pub fn display_info(&self) -> layout::DisplayInfo {
+        layout::DisplayInfo { name: self.display_name.clone(),
+                              hardware_key: self.hardware_key.clone() }
+    }
+
+    /// Re-runs the translator over every cached layout's already-downloaded
+    /// XLF (CPU only, no network). Needed when translated output depends on
+    /// something other than the layout's own XML: the code_map (see
+    /// `update_code_map`) or the display name (native webpage URL
+    /// placeholders). One failing layout is logged and skipped.
     pub fn retranslate_all_layouts(&mut self, adspace_cfg: Option<crate::adspace::AdspaceConfig>,
                                     html_port: u16) -> Result<()> {
         let layout_ids: Vec<LayoutId> = self.content.values()
@@ -337,12 +343,14 @@ impl Cache {
                 _ => None
             })
             .collect();
+        let display = self.display_info();
         for id in layout_ids {
             let name = format!("{id}.xlf");
             let xlf_path = self.dir.join(&name);
             let html_path = self.dir.join(format!("{name}.html"));
             let result = layout::Translator::new(id, &xlf_path, &html_path, &self.code_map,
                                                   adspace_cfg.clone(), html_port)
+                .map(|xl| xl.with_display(display.clone()))
                 .and_then(|xl| xl.translate());
             match result {
                 Ok((w, h, enable_stat, sync_keys)) => {
@@ -406,7 +414,8 @@ impl Cache {
     pub fn fetch_content(res: ReqFile, dir: &Path, agent: &Agent,
                           code_map: &HashMap<String, LayoutId>,
                           adspace_cfg: Option<crate::adspace::AdspaceConfig>,
-                          html_port: u16, cms: &mut xmds::Cms) -> Result<FetchedContent> {
+                          html_port: u16, display: &layout::DisplayInfo,
+                          cms: &mut xmds::Cms) -> Result<FetchedContent> {
         match res {
             ReqFile::Resource { id, layoutid, regionid, mediaid, updated } => {
                 let data = cms.get_resource(layoutid, &regionid.to_string(),
@@ -456,7 +465,7 @@ impl Cache {
                     let xl = layout::Translator::new(
                         id, &dir.join(&name), &dir.join(format!("{name}.html")),
                         code_map, adspace_cfg, html_port,
-                    )?;
+                    )?.with_display(display.clone());
                     let (w, h, enable_stat, sync_keys) = xl.translate()?;
                     Ok(FetchedContent::Layout {
                         name,
@@ -522,8 +531,9 @@ impl Cache {
             cache_dir: self.dir.join("adspace"),
             partner: self.adspace_partner.clone(),
         });
+        let display = self.display_info();
         let content = Self::fetch_content(res, &self.dir, &self.agent, &self.code_map,
-                                           adspace_cfg, self.html_port, cms)?;
+                                           adspace_cfg, self.html_port, &display, cms)?;
         self.commit(content)
     }
 
@@ -2289,8 +2299,11 @@ mod update_code_map_tests {
     use super::*;
 
     fn make_cache() -> (Cache, PathBuf) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir()
-            .join(format!("arexibo_code_map_test_{}", std::process::id()));
+            .join(format!("arexibo_code_map_test_{}_{n}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let cms = CmsSettings {
@@ -2383,6 +2396,37 @@ mod update_code_map_tests {
         assert!(!changed_again, "must not report a change when nothing genuinely differs \
                                   from the cycle before, regardless of how many duplicate \
                                   ids share this code within the same response");
+    }
+
+    #[test]
+    fn retranslate_all_layouts_fills_native_webpage_placeholders_and_follows_a_rename() {
+        let (mut cache, dir) = make_cache();
+        let xlf = r#"<layout width="1920" height="1080">
+            <region id="7" left="0" top="0" width="400" height="300">
+                <media id="9001" type="webpage" render="native" duration="10">
+                    <options><uri>https://x.test/?n=[DisplayName]&amp;k=[HardwareKey]</uri>
+                    <modeid>1</modeid></options>
+                </media>
+            </region>
+        </layout>"#;
+        fs::write(dir.join("940.xlf"), xlf).unwrap();
+        cache.content.insert("940.xlf".to_string(), Resource::Layout(Arc::new(LayoutInfo {
+            id: 940, md5: vec![1], size: (0, 0), code: None,
+            enable_stat: true, translated_version: TRANSLATOR_VERSION, sync_keys: vec![],
+        })));
+
+        cache.display_name = "totem-014".into();
+        cache.retranslate_all_layouts(None, 9696).unwrap();
+        let html = fs::read_to_string(dir.join("940.xlf.html")).unwrap();
+        // make_cache() registers with display_id "d" -- the hardware key.
+        assert!(html.contains(r#""https://x.test/?n=totem-014&k=d""#), "got:\n{html}");
+
+        cache.display_name = "totem-015".into();
+        cache.retranslate_all_layouts(None, 9696).unwrap();
+        let html = fs::read_to_string(dir.join("940.xlf.html")).unwrap();
+        assert!(html.contains(r#""https://x.test/?n=totem-015&k=d""#),
+                "a rename followed by a retranslation must update the baked-in name");
+        assert!(!html.contains("totem-014"));
     }
 
     #[test]

@@ -628,7 +628,9 @@ impl Handler {
             // is_own_derived_ws_default() exempts our own /xmr fallback
             // (deliberately port-less) from being treated as suspicious.
             let is_own_derived_default = is_own_derived_ws_default(cms, &settings.xmr_web_socket_address_in_use);
+            let mut renamed_since_last_run = false;
             if let Ok(prev) = PlayerSettings::from_file(&setting_file) {
+                renamed_since_last_run = prev.display_name != settings.display_name;
                 if !prev.xmr_web_socket_address_in_use.is_empty() && !is_own_derived_default
                     && !ws_address_has_port(&settings.xmr_web_socket_address_in_use) {
                     log::warn!("XMR WebSocket address from this registration is \
@@ -709,6 +711,10 @@ impl Handler {
                                  xmr_retry_key, cms: cms.clone(), no_verify };
             slf.sync_splash_state();
             slf.update_settings()?;
+            if renamed_since_last_run {
+                log::info!("display name changed since last run -- retranslating cached layouts");
+                slf.retranslate_cached_layouts();
+            }
             slf.schedule_check();  // only useful in case of cached schedule
             Ok(slf)
         } else {
@@ -1346,8 +1352,9 @@ impl Handler {
                                                     cache_dir: dir.join("adspace"),
                                                     partner: self.cache.adspace_partner.clone(),
                                                 });
+                                            let display = self.cache.display_info();
                                             match Cache::fetch_content(file, &dir, &agent, &code_map,
-                                                    adspace_cfg, self.cache.html_port, &mut cms)
+                                                    adspace_cfg, self.cache.html_port, &display, &mut cms)
                                                 .and_then(|content| self.cache.commit(content)) {
                                                 Ok(()) => log::info!("layout {} fetched fresh \
                                                     right before reloading it (was deferred \
@@ -1607,8 +1614,15 @@ impl Handler {
                 return Err(RestartRequired.into());
             }
             if settings != self.settings {
+                let renamed = settings.display_name != self.settings.display_name;
                 self.settings = settings;
                 self.update_settings()?;
+                if renamed {
+                    log::info!("display name changed to {:?} -- retranslating cached \
+                                layouts (native webpage URLs may embed it)",
+                               self.settings.display_name);
+                    self.retranslate_cached_layouts();
+                }
             }
             if self.pending_auth || self.pending_network {
                 // Just got authorized, or the network/CMS finally
@@ -1701,15 +1715,7 @@ impl Handler {
             log::info!("a layout code now resolves to a different id -- retranslating every \
                         cached layout so any Navigate Layout action referencing it by code \
                         picks up the new target");
-            let dir = self.cache.dir().clone();
-            let agent = self.cache.agent().clone();
-            let adspace_cfg = self.cache.adspace_enabled.then(|| crate::adspace::AdspaceConfig {
-                agent, cache_dir: dir.join("adspace"),
-                partner: self.cache.adspace_partner.clone(),
-            });
-            if let Err(e) = self.cache.retranslate_all_layouts(adspace_cfg, self.cache.html_port) {
-                log::warn!("retranslating cached layouts after a code_map change: {e:#}");
-            }
+            self.retranslate_cached_layouts();
         }
 
         // RequiredFiles always lists every currently-needed layout
@@ -1929,6 +1935,7 @@ impl Handler {
             partner: self.cache.adspace_partner.clone(),
         });
         let html_port = self.cache.html_port;
+        let display = self.cache.display_info();
         let mut done = 0usize;
 
         for chunk in pending.chunks(max_workers) {
@@ -1938,6 +1945,7 @@ impl Handler {
             let dir = &dir;
             let agent = &agent;
             let code_map = &code_map;
+            let display = &display;
             let fetch_results: Vec<(ReqFile, Result<FetchedContent>)> =
                 std::thread::scope(|scope| {
                     let handles: Vec<_> = chunk.iter().zip(cms_instances.iter_mut())
@@ -1948,7 +1956,7 @@ impl Handler {
                                 let fetch_result = match cms_result {
                                     Ok(cms) => Cache::fetch_content(
                                         file.clone(), dir, agent, code_map,
-                                        adspace_cfg, html_port, cms),
+                                        adspace_cfg, html_port, display, cms),
                                     Err(e) => Err(anyhow::anyhow!(
                                         "constructing this worker's own Cms: {e:#}")),
                                 };
@@ -2861,6 +2869,19 @@ impl Handler {
     }
 
     /// Apply new player settings.
+    /// Re-runs the translator over every cached layout (no network).
+    fn retranslate_cached_layouts(&mut self) {
+        let dir = self.cache.dir().clone();
+        let agent = self.cache.agent().clone();
+        let adspace_cfg = self.cache.adspace_enabled.then(|| crate::adspace::AdspaceConfig {
+            agent, cache_dir: dir.join("adspace"),
+            partner: self.cache.adspace_partner.clone(),
+        });
+        if let Err(e) = self.cache.retranslate_all_layouts(adspace_cfg, self.cache.html_port) {
+            log::warn!("retranslating cached layouts: {e:#}");
+        }
+    }
+
     fn update_settings(&mut self) -> Result<()> {
         // CMS's logLevel setting takes effect unless --debug is set
         // locally (an explicit override shouldn't be silently beaten
@@ -2873,6 +2894,7 @@ impl Handler {
         // adspace.rs) -- adspace_partner left unset, no confirmed CMS
         // field name found, optional in the bid request anyway.
         self.cache.adspace_enabled = self.settings.is_adspace_enabled;
+        self.cache.display_name = self.settings.display_name.clone();
 
         // Applies the CMS's own display_time_zone as *this process's*
         // local timezone (see apply_process_timezone's own doc comment
@@ -3998,6 +4020,127 @@ mod sticky_ws_address_tests {
 }
 
 #[cfg(test)]
+mod display_rename_tests {
+    use super::*;
+
+    /// Returns `names[N]` as the CMS-assigned displayName for the Nth call,
+    /// clamped to the last entry.
+    fn start_mock_with_display_names(names: Vec<&'static str>) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for (n, request) in server.incoming_requests().enumerate() {
+                let name = names[n.min(names.len() - 1)];
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>&lt;ActivationMessage code="READY"&gt;&lt;displayName&gt;{name}&lt;/displayName&gt;&lt;/ActivationMessage&gt;</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_cms_settings(port: u16) -> CmsSettings {
+        CmsSettings { address: format!("http://127.0.0.1:{port}"), key: "testkey".into(),
+                      display_id: "test-display".into(), display_name: None, proxy: None }
+    }
+
+    fn test_envdir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_display_rename_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A previous run's cache: layout 940 with a native webpage widget whose
+    /// URL carries a placeholder. Deliberately no translated .xlf.html, so
+    /// its appearance proves a retranslation ran.
+    fn seed_cached_layout(envdir: &std::path::Path) {
+        let res = envdir.join("res");
+        std::fs::create_dir_all(&res).unwrap();
+        std::fs::write(res.join("940.xlf"), r#"<layout width="1920" height="1080">
+            <region id="7" left="0" top="0" width="400" height="300">
+                <media id="9001" type="webpage" render="native" duration="10">
+                    <options><uri>https://x.test/?n=[DisplayName]&amp;k=[HardwareKey]</uri>
+                    <modeid>1</modeid></options>
+                </media>
+            </region>
+        </layout>"#).unwrap();
+        std::fs::write(res.join("content.json"), format!(
+            r#"{{"940.xlf":{{"Layout":{{"id":940,"md5":"01","size":[1920,1080],"code":null,"translated_version":{},"enable_stat":true,"sync_keys":[]}}}}}}"#,
+            crate::layout::TRANSLATOR_VERSION)).unwrap();
+    }
+
+    /// The receiver is returned so the GUI channel stays open for the test's lifetime.
+    fn new_handler(envdir: &std::path::Path, port: u16)
+                   -> (Handler, crossbeam_channel::Receiver<ToGui>) {
+        let cms = test_cms_settings(port);
+        let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
+        let handler = Handler::new(&cms, false, envdir, true, true, false,
+                                   togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
+                                   std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+        (handler, togui_rx)
+    }
+
+    #[test]
+    fn a_rename_since_the_last_run_retranslates_cached_layouts_at_startup() {
+        let envdir = test_envdir();
+        PlayerSettings { display_name: "old-name".into(), embedded_server_port: 34519,
+                          ..Default::default() }
+            .to_file(envdir.join("settings.json")).unwrap();
+        seed_cached_layout(&envdir);
+
+        let port = start_mock_with_display_names(vec!["totem-014"]);
+        let (_handler, _rx) = new_handler(&envdir, port);
+
+        let html = std::fs::read_to_string(envdir.join("res").join("940.xlf.html"))
+            .expect("a changed display name must retranslate the cached layout");
+        assert!(html.contains("n=totem-014&k=test-display"), "got:\n{html}");
+    }
+
+    #[test]
+    fn an_unchanged_name_does_not_retranslate_at_startup() {
+        let envdir = test_envdir();
+        PlayerSettings { display_name: "totem-014".into(), embedded_server_port: 34519,
+                          ..Default::default() }
+            .to_file(envdir.join("settings.json")).unwrap();
+        seed_cached_layout(&envdir);
+
+        let port = start_mock_with_display_names(vec!["totem-014"]);
+        let (_handler, _rx) = new_handler(&envdir, port);
+
+        assert!(!envdir.join("res").join("940.xlf.html").exists(),
+                "no rename, so no retranslation -- startup must stay cheap");
+    }
+
+    #[test]
+    fn a_rename_mid_session_retranslates_cached_layouts() {
+        let envdir = test_envdir();
+        seed_cached_layout(&envdir);
+
+        // Call 0 (Handler::new) says "alpha"; call 1 (collect_once) says "beta".
+        let port = start_mock_with_display_names(vec!["alpha", "beta"]);
+        let (mut handler, _rx) = new_handler(&envdir, port);
+        assert!(!envdir.join("res").join("940.xlf.html").exists(),
+                "no previous settings.json, so nothing to retranslate yet");
+
+        // The mock can't answer RequiredFiles; the settings block this
+        // exercises runs before that call, so the error is irrelevant.
+        let _ = handler.collect_once();
+
+        let html = std::fs::read_to_string(envdir.join("res").join("940.xlf.html"))
+            .expect("a mid-session rename must retranslate the cached layout");
+        assert!(html.contains("n=beta&k=test-display"), "got:\n{html}");
+    }
+}
+
+#[cfg(test)]
 mod port_change_forces_cache_purge_tests {
     use super::*;
 
@@ -4989,8 +5132,9 @@ mod handle_trigger_code_tests {
                         let dir = handler.cache.dir().clone();
                         let agent = handler.cache.agent().clone();
                         let code_map = handler.cache.code_map().clone();
+                        let display = handler.cache.display_info();
                         let _ = Cache::fetch_content(file, &dir, &agent, &code_map,
-                                                      None, handler.cache.html_port, &mut cms);
+                                                      None, handler.cache.html_port, &display, &mut cms);
                     }
                 }
                 let reason = if was_cycle_member { ForceReloadReason::CycleGroupOfOne }
