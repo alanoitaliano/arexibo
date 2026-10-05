@@ -1,9 +1,15 @@
 name: Nightly .deb build
 
-# Builds the kiosk .deb package (see deb/build-deb.sh) every night and
-# publishes it to a single, fixed "nightly" GitHub Release -- so there's
-# always one stable URL to grab the latest build from, rather than
-# having to dig through individual Actions run artifacts each time.
+# Builds the kiosk .deb packages (amd64 + arm64, see deb/build-deb.sh)
+# every night and publishes them to a single, fixed "nightly" GitHub
+# Release -- so there's always one stable URL to grab the latest build
+# from, rather than having to dig through individual Actions run
+# artifacts each time.
+#
+# Three jobs: `check` decides whether anything changed (and fixes the
+# nightly version string once, so both architectures share it), `build`
+# runs once per architecture, `publish` uploads everything to the
+# release only if every build succeeded.
 #
 # Also runnable manually (workflow_dispatch) for on-demand builds
 # without waiting for the schedule, e.g. right after merging a fix
@@ -17,23 +23,25 @@ on:
     - cron: '0 2 * * *'
   workflow_dispatch: {}
 
+env:
+  # Suppresses a widely-reported, benign Node.js runtime warning
+  # ("DEP0040: the `punycode` module is deprecated") that shows up
+  # on actions/checkout and softprops/action-gh-release -- it comes
+  # from a still-unfixed transitive dependency deep in the GitHub
+  # Actions toolkit's own shared libraries (not from our own
+  # workflow config), affecting many unrelated projects the same
+  # way (Jest, Yarn, setup-python, setup-node, ...). Targeted to
+  # this one specific warning code so other, potentially useful
+  # deprecation warnings still show up normally.
+  NODE_OPTIONS: --disable-warning=DEP0040
+
 jobs:
-  nightly-deb:
-    name: Build nightly .deb
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write  # needed to create/update the release and its tag
-    env:
-      # Suppresses a widely-reported, benign Node.js runtime warning
-      # ("DEP0040: the `punycode` module is deprecated") that shows up
-      # on actions/checkout and softprops/action-gh-release -- it comes
-      # from a still-unfixed transitive dependency deep in the GitHub
-      # Actions toolkit's own shared libraries (not from our own
-      # workflow config), affecting many unrelated projects the same
-      # way (Jest, Yarn, setup-python, setup-node, ...). Targeted to
-      # this one specific warning code so other, potentially useful
-      # deprecation warnings still show up normally.
-      NODE_OPTIONS: --disable-warning=DEP0040
+  check:
+    name: Check for changes since the last nightly
+    runs-on: ubuntu-26.04
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+      nightly_version: ${{ steps.version.outputs.nightly_version }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -58,8 +66,42 @@ jobs:
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
-      - name: Install build dependencies
+      - name: Determine nightly version
         if: steps.check.outputs.skip != 'true'
+        id: version
+        run: |
+          BASE_VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          # `~nightly.YYYYMMDD` -- the `~` sorts *before* nothing at all
+          # in dpkg's own version comparison rules, so this nightly is
+          # correctly treated as "older" than the eventual real release
+          # of the same base version, exactly the right semantics for a
+          # pre-release build (e.g. `0.6.0~nightly.20260816` < `0.6.0`).
+          # Computed once here, not per architecture: a build that crosses
+          # midnight UTC must not leave the two .deb files with different
+          # versions.
+          NIGHTLY_VERSION="${BASE_VERSION}~nightly.$(date -u +%Y%m%d)"
+          echo "nightly_version=${NIGHTLY_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Building version: ${NIGHTLY_VERSION}"
+
+  build:
+    name: Build nightly .deb (${{ matrix.arch }})
+    needs: check
+    if: needs.check.outputs.skip != 'true'
+    strategy:
+      # Let the other architecture finish so both results are visible;
+      # `publish` still requires every leg to succeed.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -72,38 +114,40 @@ jobs:
             pkg-config
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-        if: steps.check.outputs.skip != 'true'
         with:
           toolchain: stable
 
-      - name: Determine nightly version
-        if: steps.check.outputs.skip != 'true'
-        id: version
-        run: |
-          BASE_VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
-          # `~nightly.YYYYMMDD` -- the `~` sorts *before* nothing at all
-          # in dpkg's own version comparison rules, so this nightly is
-          # correctly treated as "older" than the eventual real release
-          # of the same base version, exactly the right semantics for a
-          # pre-release build (e.g. `0.6.0~nightly.20260816` < `0.6.0`).
-          NIGHTLY_VERSION="${BASE_VERSION}~nightly.$(date -u +%Y%m%d)"
-          echo "nightly_version=${NIGHTLY_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Building version: ${NIGHTLY_VERSION}"
-
       - name: Build .deb
-        if: steps.check.outputs.skip != 'true'
         # `bash deb/build-deb.sh` rather than `./deb/build-deb.sh`:
         # deliberately doesn't rely on git having tracked this file's
         # executable bit correctly (found from a real CI failure --
         # "Permission denied", exit 126 -- on a fresh runner checkout).
-        run: bash deb/build-deb.sh "${{ steps.version.outputs.nightly_version }}"
+        run: bash deb/build-deb.sh "${{ needs.check.outputs.nightly_version }}"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: deb-${{ matrix.arch }}
+          path: dist/arexibo_*.deb
+
+  publish:
+    name: Publish nightly release
+    needs: [check, build]
+    if: needs.check.outputs.skip != 'true'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write  # needed to create/update the release and its tag
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          pattern: deb-*
+          merge-multiple: true
 
       - name: Publish nightly release
-        if: steps.check.outputs.skip != 'true'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: nightly
-          name: "Nightly build (${{ steps.version.outputs.nightly_version }})"
+          name: "Nightly build (${{ needs.check.outputs.nightly_version }})"
           body: |
             Automated nightly build from commit ${{ github.sha }}.
 
