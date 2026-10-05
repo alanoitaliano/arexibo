@@ -411,6 +411,9 @@ impl Cache {
     /// real `&mut self` method) applies this the same way `download`
     /// always did in one synchronous step, just working from
     /// already-fetched data instead of fetching it itself.
+    // Not bundled into an options struct: purely a clippy style lint (same
+    // call as `Handler::new`), not worth touching every call site for.
+    #[allow(clippy::too_many_arguments)]
     pub fn fetch_content(res: ReqFile, dir: &Path, agent: &Agent,
                           code_map: &HashMap<String, LayoutId>,
                           adspace_cfg: Option<crate::adspace::AdspaceConfig>,
