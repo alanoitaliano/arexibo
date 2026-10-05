@@ -353,7 +353,9 @@ impl Server {
         let (path_only, query) = url.split_once('?').unwrap_or((url, ""));
         Ok(match path_only {
             // built-in files?
-            "/favicon.ico" => Response::from_data(b"").boxed(),
+            "/favicon.ico" => Response::from_data(FAVICON)
+                .with_header(Header::from_bytes(b"Content-Type", b"image/x-icon").unwrap())
+                .boxed(),
             "/branding.png" => Response::from_data(SPLASH_LOGO)
                 .with_header(Header::from_bytes(b"Content-Type", b"image/png").unwrap())
                 .boxed(),
@@ -731,6 +733,10 @@ new QWebChannel(qt.webChannelTransport, function(channel) {{
 // specific one. Replace this file (same name/path) to customize.
 const SPLASH_LOGO: &[u8] = include_bytes!("../assets/branding.png");
 
+// 16/32 px icon built from assets/arexibo-256.png. Replaces an empty reply
+// without Content-Type, which made Chromium sniff the content on every load.
+const FAVICON: &[u8] = include_bytes!("../assets/favicon.ico");
+
 
 /// Parse a HTTP Range header.
 fn parse_range(total_size: u64, header: &str) -> Result<(u64, u64, u64)> {
@@ -951,6 +957,20 @@ mod no_cache_header_tests {
         let resp = ureq::get(&format!("http://127.0.0.1:{port}/testfile.txt")).call().unwrap();
         let cache_control = resp.headers().get("Cache-Control").map(|v| v.to_str().unwrap());
         assert_eq!(cache_control, Some("no-store"));
+    }
+
+    #[test]
+    fn favicon_is_a_real_icon_with_its_content_type() {
+        let port = make_test_server();
+        let resp = ureq::get(&format!("http://127.0.0.1:{port}/favicon.ico")).call().unwrap();
+        let content_type = resp.headers().get("Content-Type").map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(content_type.as_deref(), Some("image/x-icon"));
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut resp.into_body().into_reader(), &mut body).unwrap();
+        assert_eq!(body, FAVICON, "must serve the built-in icon, not an empty body");
+        // ICONDIR: reserved = 0, type = 1 (icon), at least one image.
+        assert_eq!(&body[..4], &[0, 0, 1, 0]);
+        assert!(u16::from_le_bytes([body[4], body[5]]) >= 1);
     }
 
     #[test]
