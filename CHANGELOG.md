@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.6 - Oct 2026
+
+- Fix image and video alignment being ignored: the CMS writes it as
+  `<alignId>` / `<valignId>` child options, but only an older attribute
+  spelling was read, so everything ended up centered. Left/right and
+  top/bottom now work (visible with the `center` scale type, where the
+  media doesn't fill its region).
+- Native webpage widgets ("Open Natively"): a touch or click now restarts
+  the widget's duration countdown, so a layout no longer expires or reloads
+  while someone is using the page. Main layout only (not overlay layouts);
+  keyboard, wheel and dragging do not count.
+- Serve a real `/favicon.ico` (the arexibo logo) instead of an empty reply
+  without a `Content-Type`, which made Chromium sniff the content on every
+  page load.
+- Fix `--web-debug` not enabling part of the Qt-side logging: the flag was a
+  separate copy per source file, so some lines (e.g. `run JavaScript:`) were
+  never printed. They now appear with `--web-debug` (noisy by design).
+- The translator version is bumped, so cached layouts are re-downloaded and
+  retranslated once at the first start after upgrading and pick up the
+  fixes above without needing `--clear`.
+
 ## 0.6.5 - Oct 2026
 
 - Webpage widget in "Open Natively" mode: `[DisplayName]` and

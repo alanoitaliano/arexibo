@@ -16,7 +16,9 @@ use crate::util::{ElementExt, percent_decode, percent_encode};
 // - overriding duration from resources
 // - fromDt/toDt
 
-pub const TRANSLATOR_VERSION: u32 = 31;
+/// Bump when the generated page changes: cached layouts translated with an
+/// older version are re-downloaded and retranslated.
+pub const TRANSLATOR_VERSION: u32 = 32;
 
 const LAYOUT_CSS: &str = r##"
 body { margin: 0; background-repeat: no-repeat; overflow: hidden; }
@@ -1836,7 +1838,14 @@ fn object_fit(el: &Element) -> &'static str {
 }
 
 fn object_pos(el: &Element) -> &'static str {
-    match (el.def_attr("align", "center"), el.def_attr("halign", "middle")) {
+    // CMS 4.x writes <alignId> (left/center/right) and <valignId>
+    // (top/middle/bottom) as children of <options>; the attributes are the
+    // older spelling, kept as a fallback.
+    let align = el.find("alignId").map(|e| e.text().trim())
+        .or_else(|| el.get_attr("align")).unwrap_or("center");
+    let valign = el.find("valignId").map(|e| e.text().trim())
+        .or_else(|| el.get_attr("halign")).unwrap_or("middle");
+    match (align, valign) {
         ("left", "top") => " object-position: left top;",
         ("left", "bottom") => " object-position: left bottom;",
         ("left", _) => " object-position: left;",
@@ -1853,6 +1862,109 @@ fn object_pos(el: &Element) -> &'static str {
 
 
 
+
+#[cfg(test)]
+mod image_alignment_tests {
+    use super::*;
+    use std::io::Read;
+
+    fn tempdir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir()
+            .join(format!("arexibo_image_align_test_{}_{n}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    fn translate_xlf(xlf: &str) -> String {
+        let dir = tempdir();
+        let xlf_path = dir.join("test.xlf");
+        let html_path = dir.join("test.html");
+        fs::write(&xlf_path, xlf).unwrap();
+        let map = HashMap::new();
+        Translator::new(1, &xlf_path, &html_path, &map, None, 0).unwrap().translate().unwrap();
+        let mut html = String::new();
+        fs::File::open(html_path).unwrap().read_to_string(&mut html).unwrap();
+        html
+    }
+
+    /// One image region, options written the way CMS 4.x does.
+    fn image_xlf(options: &str) -> String {
+        format!(r##"<layout width="1080" height="1920" bgcolor="#dfe3e8" schemaVersion="4">
+            <region id="1" width="512" height="560" top="76" left="20" zindex="1"><options/>
+              <media id="9" type="image" render="native" duration="60" fileId="267">
+                <options><uri>267.png</uri>{options}</options><raw/></media></region></layout>"##)
+    }
+
+    /// The style attribute of the generated <img id='m9'>.
+    fn img_style(html: &str) -> String {
+        let start = html.find("<img class='media r1' id='m9'").expect("no <img> generated");
+        let rest = &html[start..];
+        let s = rest.find("style='").unwrap() + "style='".len();
+        rest[s..s + rest[s..].find('\'').unwrap()].to_string()
+    }
+
+    #[test]
+    fn every_cms_alignment_combination_produces_its_object_position() {
+        // (alignId, valignId) -> expected object-position, as the CMS editor
+        // shows it. Real report: all of these used to come out centered.
+        let cases = [
+            ("left", "top", " object-position: left top;"),
+            ("center", "top", " object-position: top;"),
+            ("right", "top", " object-position: right top;"),
+            ("left", "middle", " object-position: left;"),
+            ("center", "middle", ""),
+            ("right", "middle", " object-position: right;"),
+            ("left", "bottom", " object-position: left bottom;"),
+            ("center", "bottom", " object-position: bottom;"),
+            ("right", "bottom", " object-position: right bottom;"),
+        ];
+        for (a, v, expected) in cases {
+            let html = translate_xlf(&image_xlf(&format!(
+                "<scaleType>center</scaleType><alignId>{a}</alignId><valignId>{v}</valignId>")));
+            let style = img_style(&html);
+            assert!(style.contains("object-fit: contain;"), "{a}/{v}: {style}");
+            if expected.is_empty() {
+                assert!(!style.contains("object-position"), "{a}/{v} must stay default: {style}");
+            } else {
+                assert!(style.contains(expected), "{a}/{v} expected {expected:?}, got: {style}");
+            }
+        }
+    }
+
+    #[test]
+    fn stretch_keeps_fill_and_still_carries_the_alignment() {
+        let html = translate_xlf(&image_xlf(
+            "<scaleType>stretch</scaleType><alignId>left</alignId><valignId>top</valignId>"));
+        let style = img_style(&html);
+        assert!(style.contains("object-fit: fill;"), "{style}");
+        assert!(style.contains("object-position: left top;"), "{style}");
+    }
+
+    #[test]
+    fn missing_alignment_options_leave_the_default_centered_position() {
+        let html = translate_xlf(&image_xlf("<scaleType>center</scaleType>"));
+        assert!(!img_style(&html).contains("object-position"), "{}", img_style(&html));
+    }
+
+    #[test]
+    fn the_older_attribute_spelling_on_options_still_works() {
+        let xlf = image_xlf("<scaleType>center</scaleType>")
+            .replace("<options><uri>", "<options align=\"right\" halign=\"bottom\"><uri>");
+        let style = img_style(&translate_xlf(&xlf));
+        assert!(style.contains("object-position: right bottom;"), "{style}");
+    }
+
+    #[test]
+    fn child_elements_win_over_the_older_attributes() {
+        let xlf = image_xlf("<alignId>left</alignId><valignId>top</valignId>")
+            .replace("<options><uri>", "<options align=\"right\" halign=\"bottom\"><uri>");
+        let style = img_style(&translate_xlf(&xlf));
+        assert!(style.contains("object-position: left top;"), "{style}");
+    }
+}
 
 #[cfg(test)]
 mod transition_tests {

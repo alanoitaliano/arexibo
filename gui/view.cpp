@@ -587,9 +587,9 @@ bool Window::eventFilter(QObject *watched, QEvent *event)
                 it.value()->setFocus();
                 // A touched native webpage restarts its own duration countdown.
                 if (view) {
-                    // Not runJavascriptImpl: its --web-debug gate reads a per-file copy
-                    // of g_web_debug_enabled that is never set. The result line below is
-                    // always printed, so the reset can be checked on a real device.
+                    // Not runJavascriptImpl: its log only prints under --web-debug, while
+                    // the result line below is always printed, so the reset can be
+                    // checked on a real device without that flag.
                     const int mid = it.key();
                     view->page()->runJavaScript(
                         QString("window.arexibo ? (window.arexibo.touchReset ? "

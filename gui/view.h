@@ -46,7 +46,8 @@
 // wanted this level of detail. A single flag, not a whole new one, on
 // request: this one's own existing description already matched exactly
 // what these do.
-static bool g_web_debug_enabled = false;
+// inline: one shared flag for every .cpp (a `static` here was one copy per file).
+inline bool g_web_debug_enabled = false;
 
 class LoggingPage : public QWebEnginePage
 {

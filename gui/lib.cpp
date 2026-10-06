@@ -309,6 +309,11 @@ void setup(const char *base_uri, const char *screen, int inspect, int debug,
                 // regardless of whether we skip below.
                 document.documentElement.style.overflowX = 'hidden';
                 document.documentElement.style.overflowY = 'hidden';
+                // <html> now clips, so <body>'s own overflow no longer goes to
+                // the viewport and would cut transform-scaled content at its
+                // untransformed box (flip clock): restore that behaviour.
+                body.style.overflowX = 'visible';
+                body.style.overflowY = 'visible';
                 // Native PDF widget: already fits itself correctly.
                 if (document.getElementById('the-canvas')) return;
                 // A degenerate transform/size (Infinity/NaN, from a CMS
