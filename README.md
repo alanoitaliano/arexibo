@@ -17,7 +17,8 @@ All the other settings from the cms should work including allow_wan_access and e
 
 ## Installation
 
-A nightly build is provided but it's better to compile from source.
+Tagged releases and a nightly build provide `.deb` packages for amd64 and arm64, built on
+Ubuntu 26.04, but it's better to compile from source.
 
 To build from source, you need:
 
@@ -71,7 +72,10 @@ arexibo --host <https://my.cms/> --key <key> <dir>
 ```
 
 Further configuration options are `--display-id` (which is normally
-auto-generated from machine characteristics) and `--proxy` (if needed).
+auto-generated from machine characteristics), `--display-name` (the initial
+name of the display), `--screen` (the screen to show Arexibo on: a number
+starting from 1 or a name; `--screen list` lists the connected screens) and
+`--proxy` (if needed).
 
 * or launch
 
@@ -84,11 +88,6 @@ then you are given the opportunity to enter cms address and key directly on the 
 Arexibo will cache the configuration in the directory, so that in the future you
 only need to start with
 
-## other configuration parameters:
-
---allow-offline: tolerates the CMS being unreachable at startup, falling back to cached settings/content if available, instead of failing outright.
---no-verify: skips TLS certificate verification – only for testing against a CMS with a self-signed certificate, never for production.
-
 ```
 arexibo <dir>
 ```
@@ -96,6 +95,20 @@ arexibo <dir>
 Log messages are printed to stdout.  The GUI window will only show up once the
 display is authorized.
 
+## Other configuration parameters
+
+* `--disallow-offline`: requires a live CMS connection at startup, instead of the default of falling back to the cached settings/content (if available) when the CMS is unreachable.
+* `--allow-offline`: deprecated and ignored (falling back to the cache is now the default); kept so existing scripts don't break.
+* `--no-verify`: skips TLS certificate verification – only for testing against a CMS with a self-signed certificate, never for production.
+
+
+## Webpage widgets in "Open Natively" mode
+
+* `[DisplayName]` and `[HardwareKey]` in the URL are replaced with the display's name
+  (as assigned by the CMS) and its hardware key, url-encoded.
+* A touch or click on the page restarts the widget's duration countdown, so the layout
+  doesn't expire or reload while someone is using the page.  This applies to the main
+  layout only; keyboard, mouse wheel and dragging don't count.
 
 ## Standalone setup with X server
 
@@ -126,8 +139,9 @@ btw they are automatically installed by the .deb package.
 ## Useful flags for development
 
     --debug: verbose logging (SOAP calls, internal state transitions).
-    --web-debug: logs every JS console message and page error from the rendered content – useful when troubleshooting a specific widget that isn’t displaying correctly.
-    --clear: wipes the local file cache (downloaded media/widget pages), forcing a full re-download on next start. Does not affect cached CMS connection settings, it's always recommended to run --clear once after a new git pull or git clone 
+    --web-debug: logs every JS console message and page error from every frame of the rendered content, the player's own `arexibo-show:`/`arexibo-shrink:` diagnostics and the JavaScript the player runs on the layout page (region switches, widget reloads, ...) – very verbose, useful when troubleshooting a specific widget that isn’t displaying correctly. Also turns on Chromium's verbose logging and runs it in single-process mode.
+    --inspect: shows the web inspector, to debug layout problems.
+    --clear: wipes the local file cache (downloaded media/widget pages), forcing a full re-download on next start. Does not affect cached CMS connection settings, it's always recommended to run --clear once after a new git pull or git clone. Cached layouts are also retranslated automatically when a release changes the translator version.
 
 ## Some useful environment variables
 
@@ -136,6 +150,7 @@ Normal use:
     AREXIBO_FONT_SCALE: a numeric multiplier (e.g. 0.91) applied globally to font sizes, to correct for rendering differences compared to a reference client on a different platform. Leave unset for the default (no correction).
     QTWEBENGINE_CHROMIUM_FLAGS: standard Qt/Chromium mechanism for passing extra Chromium command-line flags (e.g. GPU-related tuning for a specific graphics driver). arexibo appends its own required flag (--disable-pinch, needed to disable pinch-to-zoom on multitouch panels) to whatever you set here, rather than overwriting it – both apply together.
     QTWEBENGINE_REMOTE_DEBUGGING: QTWEBENGINE_REMOTE_DEBUGGING=9222 as an environment variable lets you inspect the rendered page from another machine’s Chrome/Edge at http://<host>:9222 (via an SSH tunnel if not on the same network) – useful for confirming content renders correctly without needing eyes on the actual totem screen.
+    AREXIBO_FORCE_WS_ADDRESS: forces the WebSocket XMR address used for push messages, regardless of what the CMS reports when the player registers (useful when the CMS's own WebSocket XMR eligibility check is unreliable). Leave unset to use the address the CMS provides.
 
 Diagnostic only – not for production use:
 
