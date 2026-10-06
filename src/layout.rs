@@ -3017,7 +3017,7 @@ style='position: fixed"),
         let xlf = r#"<layout width="1080" height="1920">
             <region id="1" left="0" top="0" width="250" height="141">
                 <media id="1" type="localvideo" duration="60">
-                    <options><uri>file%3A%2F%2F%2Fhome%2Ftmaxlab%2Farexibo-test%2Fres%2F148.mp4</uri></options>
+                    <options><uri>file%3A%2F%2F%2Fhome%2Fuser%2Farexibo-test%2Fres%2F148.mp4</uri></options>
                 </media>
             </region>
             <region id="2" left="300" top="0" width="250" height="141">
@@ -3028,7 +3028,7 @@ style='position: fixed"),
         </layout>"#;
         let html = translate_xlf(xlf);
         assert!(html.contains(
-            "id='m1' src='/local-file?path=/home/tmaxlab/arexibo-test/res/148.mp4'"),
+            "id='m1' src='/local-file?path=/home/user/arexibo-test/res/148.mp4'"),
             "a file:// URI must be proxied through the same-origin /local-file endpoint, \
              not embedded directly -- got:\n{html}");
         assert!(html.contains("id='m2' src='192.mp4'"),

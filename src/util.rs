@@ -372,20 +372,20 @@ mod tests {
     }
 
     #[test]
-    fn percent_decode_real_http_command_from_user_log() {
+    fn percent_decode_http_command() {
         assert_eq!(
             percent_decode(
-                "http%7Chttp%3A%2F%2F192.168.0.245%3A8888%2Fping%7Capplication%2Fjson%7C\
+                "http%7Chttp%3A%2F%2F192.0.2.10%3A8888%2Fping%7Capplication%2Fjson%7C\
                  %7B%22method%22%3A%22GET%22%2C%22headers%22%3A%22%7B%7D%22%2C%22body%22%3A%22%7B%7D%22%7D"
             ),
-            r#"http|http://192.168.0.245:8888/ping|application/json|{"method":"GET","headers":"{}","body":"{}"}"#
+            r#"http|http://192.0.2.10:8888/ping|application/json|{"method":"GET","headers":"{}","body":"{}"}"#
         );
     }
 
     #[test]
     fn percent_encode_leaves_plain_paths_alone() {
-        assert_eq!(percent_encode("/home/tmaxlab/arexibo-test/res/148.mp4"),
-                   "/home/tmaxlab/arexibo-test/res/148.mp4");
+        assert_eq!(percent_encode("/home/user/arexibo-test/res/148.mp4"),
+                   "/home/user/arexibo-test/res/148.mp4");
     }
 
     #[test]

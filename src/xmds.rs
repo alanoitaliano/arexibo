@@ -253,7 +253,7 @@ impl Cms {
                 collect_interval: tree.def_child("collectInterval", 300u32)?,
                 // Confirmed real (present in a real captured
                 // RegisterDisplay response, value 2 -- see this
-                // module's own REAL_LEAD_XML/REAL_FOLLOWER_XML test
+                // module's own LEAD_XML/FOLLOWER_XML test
                 // fixtures), but this specific field was never parsed
                 // here until now. `1` (sequential) if the CMS omits
                 // it, matching this project's own established
@@ -1217,19 +1217,12 @@ mod sync_group_parsing_tests {
     use super::*;
     use crate::config::SyncRole;
 
-    // Two real register.xml captures shared directly by the user: a
-    // Lead and a Follower in the same Sync Group, same CMS -- used
-    // verbatim (not reconstructed/simplified), including their real
-    // root element (`<display ...>`, matching the real Soap4.php
-    // source: `$displayElement = $return->createElement('display')`)
-    // rather than the `<ActivationMessage>` root the *other* tests in
-    // this file happen to use -- confirms our parser doesn't care what
-    // the root element is actually named, only its own attributes/
-    // children, matching the real wire format precisely for this case.
+    // register.xml samples: a Lead and a Follower in the same Sync Group,
+    // `<display>` root as sent by the CMS. Values are anonymized.
 
-    const REAL_LEAD_XML: &str = r#"<display date="2026-08-27 09:02:49" timezone="Europe/Rome" status="0" code="READY" message="Display is active and ready to start." version_instructions="" localTimezone="Europe/Rome" localDate="2026-08-27 09:02:49" checkSchedule="1734717998" checkRf="987824267"><collectInterval>305</collectInterval><downloadStartWindow>:</downloadStartWindow><downloadEndWindow>:</downloadEndWindow><xmrNetworkAddress>tcp://168.119.16.68:9505</xmrNetworkAddress><xmrWebSocketAddress>ws://168.119.16.68:8080</xmrWebSocketAddress><statsEnabled type="checkbox">1</statsEnabled><aggregationLevel type="string">Individual</aggregationLevel><sizeX>0</sizeX><sizeY>0</sizeY><offsetX>0</offsetX><offsetY>0</offsetY><logLevel>error</logLevel><elevateLogsUntil type="int">0</elevateLogsUntil><enableShellCommands type="checkbox">1</enableShellCommands><expireModifiedLayouts type="checkbox">1</expireModifiedLayouts><maxConcurrentDownloads>2</maxConcurrentDownloads><shellCommandAllowList/><sendCurrentLayoutAsStatusUpdate type="checkbox">1</sendCurrentLayoutAsStatusUpdate><screenShotRequestInterval>0</screenShotRequestInterval><screenShotSize>0</screenShotSize><maxLogFileUploads>3</maxLogFileUploads><embeddedServerPort>9696</embeddedServerPort><preventSleep type="checkbox">1</preventSleep><forceHttps type="checkbox">1</forceHttps><embeddedServerAllowWan type="checkbox">0</embeddedServerAllowWan><isRecordGeoLocationOnProofOfPlay type="checkbox">0</isRecordGeoLocationOnProofOfPlay><newCmsAddress/><newCmsKey/><displayName>totemlinux01</displayName><screenShotRequested type="checkbox">0</screenShotRequested><displayTimeZone>Europe/Rome</displayTimeZone><isAdspaceEnabled type="checkbox">0</isAdspaceEnabled><xmrType type="string">ws</xmrType><xmrCmsKey type="string">xmr_032379f704129794b965</xmrCmsKey><commands><TESTTOUCH><commandString><![CDATA[touch /tmp/xibo-command-test]]></commandString><validationString><![CDATA[]]></validationString><createAlertOn><![CDATA[never]]></createAlertOn></TESTTOUCH></commands><syncGroup>lead</syncGroup><syncPublisherPort>9590</syncPublisherPort><syncSwitchDelay>750</syncSwitchDelay><syncVideoPauseDelay>100</syncVideoPauseDelay></display>"#;
+    const LEAD_XML: &str = r#"<display date="2026-08-27 09:02:49" timezone="Europe/Rome" status="0" code="READY" message="Display is active and ready to start." version_instructions="" localTimezone="Europe/Rome" localDate="2026-08-27 09:02:49" checkSchedule="1734717998" checkRf="987824267"><collectInterval>305</collectInterval><downloadStartWindow>:</downloadStartWindow><downloadEndWindow>:</downloadEndWindow><xmrNetworkAddress>tcp://192.0.2.10:9505</xmrNetworkAddress><xmrWebSocketAddress>ws://192.0.2.10:8080</xmrWebSocketAddress><statsEnabled type="checkbox">1</statsEnabled><aggregationLevel type="string">Individual</aggregationLevel><sizeX>0</sizeX><sizeY>0</sizeY><offsetX>0</offsetX><offsetY>0</offsetY><logLevel>error</logLevel><elevateLogsUntil type="int">0</elevateLogsUntil><enableShellCommands type="checkbox">1</enableShellCommands><expireModifiedLayouts type="checkbox">1</expireModifiedLayouts><maxConcurrentDownloads>2</maxConcurrentDownloads><shellCommandAllowList/><sendCurrentLayoutAsStatusUpdate type="checkbox">1</sendCurrentLayoutAsStatusUpdate><screenShotRequestInterval>0</screenShotRequestInterval><screenShotSize>0</screenShotSize><maxLogFileUploads>3</maxLogFileUploads><embeddedServerPort>9696</embeddedServerPort><preventSleep type="checkbox">1</preventSleep><forceHttps type="checkbox">1</forceHttps><embeddedServerAllowWan type="checkbox">0</embeddedServerAllowWan><isRecordGeoLocationOnProofOfPlay type="checkbox">0</isRecordGeoLocationOnProofOfPlay><newCmsAddress/><newCmsKey/><displayName>test-lead</displayName><screenShotRequested type="checkbox">0</screenShotRequested><displayTimeZone>Europe/Rome</displayTimeZone><isAdspaceEnabled type="checkbox">0</isAdspaceEnabled><xmrType type="string">ws</xmrType><xmrCmsKey type="string">xmr_00000000000000000000</xmrCmsKey><commands><TESTTOUCH><commandString><![CDATA[touch /tmp/xibo-command-test]]></commandString><validationString><![CDATA[]]></validationString><createAlertOn><![CDATA[never]]></createAlertOn></TESTTOUCH></commands><syncGroup>lead</syncGroup><syncPublisherPort>9590</syncPublisherPort><syncSwitchDelay>750</syncSwitchDelay><syncVideoPauseDelay>100</syncVideoPauseDelay></display>"#;
 
-    const REAL_FOLLOWER_XML: &str = r#"<display date="2026-08-27 09:06:57" timezone="Europe/Rome" status="0" code="READY" message="Display is active and ready to start." version_instructions="" localTimezone="Europe/Rome" localDate="2026-08-27 09:06:57" checkSchedule="2496328210" checkRf="1573506232"><collectInterval>296</collectInterval><downloadStartWindow>:</downloadStartWindow><downloadEndWindow>:</downloadEndWindow><xmrNetworkAddress>tcp://168.119.16.68:9505</xmrNetworkAddress><xmrWebSocketAddress>ws://168.119.16.68:8080</xmrWebSocketAddress><statsEnabled type="checkbox">0</statsEnabled><aggregationLevel type="string">Individual</aggregationLevel><sizeX>0</sizeX><sizeY>0</sizeY><offsetX>0</offsetX><offsetY>0</offsetY><logLevel>error</logLevel><elevateLogsUntil type="int">0</elevateLogsUntil><enableShellCommands type="checkbox">0</enableShellCommands><expireModifiedLayouts type="checkbox">0</expireModifiedLayouts><maxConcurrentDownloads>2</maxConcurrentDownloads><shellCommandAllowList/><sendCurrentLayoutAsStatusUpdate type="checkbox">1</sendCurrentLayoutAsStatusUpdate><screenShotRequestInterval>0</screenShotRequestInterval><screenShotSize>0</screenShotSize><maxLogFileUploads>3</maxLogFileUploads><embeddedServerPort>9696</embeddedServerPort><preventSleep type="checkbox">1</preventSleep><forceHttps type="checkbox">1</forceHttps><embeddedServerAllowWan type="checkbox">0</embeddedServerAllowWan><isRecordGeoLocationOnProofOfPlay type="checkbox">0</isRecordGeoLocationOnProofOfPlay><newCmsAddress/><newCmsKey/><displayName>totem-kss1al</displayName><screenShotRequested type="checkbox">0</screenShotRequested><displayTimeZone>Europe/Rome</displayTimeZone><isAdspaceEnabled type="checkbox">0</isAdspaceEnabled><xmrType type="string">ws</xmrType><xmrCmsKey type="string">xmr_032379f704129794b965</xmrCmsKey><commands><TESTTOUCH><commandString><![CDATA[touch /tmp/xibo-command-test]]></commandString><validationString><![CDATA[]]></validationString><createAlertOn><![CDATA[never]]></createAlertOn></TESTTOUCH></commands><syncGroup>192.168.1.235</syncGroup><syncPublisherPort>9590</syncPublisherPort><syncSwitchDelay>750</syncSwitchDelay><syncVideoPauseDelay>100</syncVideoPauseDelay></display>"#;
+    const FOLLOWER_XML: &str = r#"<display date="2026-08-27 09:06:57" timezone="Europe/Rome" status="0" code="READY" message="Display is active and ready to start." version_instructions="" localTimezone="Europe/Rome" localDate="2026-08-27 09:06:57" checkSchedule="2496328210" checkRf="1573506232"><collectInterval>296</collectInterval><downloadStartWindow>:</downloadStartWindow><downloadEndWindow>:</downloadEndWindow><xmrNetworkAddress>tcp://192.0.2.10:9505</xmrNetworkAddress><xmrWebSocketAddress>ws://192.0.2.10:8080</xmrWebSocketAddress><statsEnabled type="checkbox">0</statsEnabled><aggregationLevel type="string">Individual</aggregationLevel><sizeX>0</sizeX><sizeY>0</sizeY><offsetX>0</offsetX><offsetY>0</offsetY><logLevel>error</logLevel><elevateLogsUntil type="int">0</elevateLogsUntil><enableShellCommands type="checkbox">0</enableShellCommands><expireModifiedLayouts type="checkbox">0</expireModifiedLayouts><maxConcurrentDownloads>2</maxConcurrentDownloads><shellCommandAllowList/><sendCurrentLayoutAsStatusUpdate type="checkbox">1</sendCurrentLayoutAsStatusUpdate><screenShotRequestInterval>0</screenShotRequestInterval><screenShotSize>0</screenShotSize><maxLogFileUploads>3</maxLogFileUploads><embeddedServerPort>9696</embeddedServerPort><preventSleep type="checkbox">1</preventSleep><forceHttps type="checkbox">1</forceHttps><embeddedServerAllowWan type="checkbox">0</embeddedServerAllowWan><isRecordGeoLocationOnProofOfPlay type="checkbox">0</isRecordGeoLocationOnProofOfPlay><newCmsAddress/><newCmsKey/><displayName>test-follower</displayName><screenShotRequested type="checkbox">0</screenShotRequested><displayTimeZone>Europe/Rome</displayTimeZone><isAdspaceEnabled type="checkbox">0</isAdspaceEnabled><xmrType type="string">ws</xmrType><xmrCmsKey type="string">xmr_00000000000000000000</xmrCmsKey><commands><TESTTOUCH><commandString><![CDATA[touch /tmp/xibo-command-test]]></commandString><validationString><![CDATA[]]></validationString><createAlertOn><![CDATA[never]]></createAlertOn></TESTTOUCH></commands><syncGroup>192.0.2.20</syncGroup><syncPublisherPort>9590</syncPublisherPort><syncSwitchDelay>750</syncSwitchDelay><syncVideoPauseDelay>100</syncVideoPauseDelay></display>"#;
 
     fn start_mock(activation_body: &'static str) -> u16 {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
@@ -1264,8 +1257,8 @@ mod sync_group_parsing_tests {
     }
 
     #[test]
-    fn parses_the_real_lead_capture() {
-        let port = start_mock(REAL_LEAD_XML);
+    fn parses_a_lead_response() {
+        let port = start_mock(LEAD_XML);
         let mut cms = test_cms(port);
         let settings = cms.register_display().unwrap().unwrap();
         assert_eq!(settings.sync_role, SyncRole::Lead);
@@ -1273,16 +1266,16 @@ mod sync_group_parsing_tests {
         assert_eq!(settings.sync_switch_delay, 750);
         assert_eq!(settings.sync_video_pause_delay, 100);
         assert_eq!(settings.max_concurrent_downloads, 2,
-                   "confirmed real in this same capture -- must actually be parsed now");
+                   "must be parsed");
     }
 
     #[test]
-    fn parses_the_real_follower_capture() {
-        let port = start_mock(REAL_FOLLOWER_XML);
+    fn parses_a_follower_response() {
+        let port = start_mock(FOLLOWER_XML);
         let mut cms = test_cms(port);
         let settings = cms.register_display().unwrap().unwrap();
         assert_eq!(settings.sync_role,
-                   SyncRole::Follower { lead_addr: "192.168.1.235".into() });
+                   SyncRole::Follower { lead_addr: "192.0.2.20".into() });
         assert_eq!(settings.sync_publisher_port, 9590);
     }
 

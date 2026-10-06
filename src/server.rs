@@ -895,28 +895,40 @@ mod stable_port_tests {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
     #[test]
-    fn embedded_server_port_is_the_fixed_stable_constant_not_random() {
-        // Regression test for a real bug: this port used to be chosen
-        // randomly (0, OS-assigned) on every startup, but cached
-        // layout HTML has it baked directly into every widget iframe's
-        // own absolute URL -- a layout that doesn't need
-        // re-translating (no --clear, unchanged XLF) would otherwise
-        // keep pointing at whatever port a *previous* run happened to
-        // get, which is essentially never the current run's real port.
+    fn embedded_server_port_falls_back_to_the_fixed_stable_constant_not_random() {
+        // Regression: this port was OS-assigned on every startup, but cached
+        // layout HTML bakes it into every widget iframe URL.
+        assert_ne!(EMBEDDED_SERVER_PORT, 0);
+        assert_eq!(effective_port(0), EMBEDDED_SERVER_PORT,
+                   "without a CMS-reported port the fixed constant must be used, not a random one");
+        assert_eq!(effective_port(8080), 8080, "a port reported by the CMS wins");
+    }
+
+    #[test]
+    fn server_binds_exactly_the_requested_port() {
+        // Not EMBEDDED_SERVER_PORT itself: it lies in the OS's ephemeral range, so
+        // another test's server (bound to port 0) can hold it -> EADDRINUSE.
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir()
             .join(format!("arexibo_stable_port_test_{}_{n}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let (tx, _rx) = unbounded();
-        let (trigger_tx, _trigger_rx) = unbounded();
-        let (fault_tx, _fault_rx) = unbounded();
-        let (manual_register_tx, _manual_register_rx) = unbounded();
-        let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", EMBEDDED_SERVER_PORT, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
-        assert_eq!(server.port(), EMBEDDED_SERVER_PORT,
-                   "the embedded server must use the fixed, stable port constant, \
-                    not a randomly OS-assigned one -- otherwise cached widget iframe \
-                    URLs from a previous run point at a dead port after a restart");
+        let mut last_err = None;
+        for _ in 0..10 {
+            let want = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+            let (tx, _rx) = unbounded();
+            let (trigger_tx, _trigger_rx) = unbounded();
+            let (fault_tx, _fault_rx) = unbounded();
+            let (manual_register_tx, _manual_register_rx) = unbounded();
+            let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
+            match Server::new(dir.clone(), "127.0.0.1", want, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))) {
+                Ok(server) => {
+                    assert_eq!(server.port(), want, "a requested non-zero port must be used as is");
+                    return;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        panic!("could not bind any free port: {last_err:?}");
     }
 }
 
