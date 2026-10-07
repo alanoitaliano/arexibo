@@ -305,6 +305,11 @@ void setup(const char *base_uri, const char *screen, int inspect, int debug,
             function tryShrink() {
                 var body = document.body;
                 if (!body) return;
+                // Modules declaring scaleContent (embedded) handle scaling themselves.
+                try {
+                    var wd = window.widgetData;
+                    if (wd && wd[0] && wd[0].properties && ('scaleContent' in wd[0].properties)) return;
+                } catch (e) {}
                 // A CSS transform is purely visual; clip overflow
                 // regardless of whether we skip below.
                 document.documentElement.style.overflowX = 'hidden';
