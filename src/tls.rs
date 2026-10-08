@@ -30,7 +30,7 @@ fn system_certificates() -> rustls_native_certs::CertificateResult {
     if bundle.is_none() && result.certs.is_empty() {
         log::warn!("no system CA certificates found in Linux trust store locations");
     }
-    result.certs.sort_unstable();
+    result.certs.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
     result.certs.dedup();
     result
 }
